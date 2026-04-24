@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "mcp-shield": {
+      "command": "mcp-shield",
+      "args": ["run", "--config", "mcp-shield.yaml"]
+    }
+  }
+}

@@ -1,0 +1,40 @@
+# MCP Shield gateway configuration
+#
+# This file defines:
+# 1. Downstream MCP servers to proxy
+# 2. Security policies (what to do when sensitive data is detected)
+# 3. Audit log settings
+
+downstream_servers:
+  filesystem:
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+
+  github:
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-github"]
+    env:
+      GITHUB_TOKEN: "${GITHUB_TOKEN}"
+
+policy:
+  # Global defaults — applied to all servers/tools unless overridden
+  default_action: log        # log | redact | block
+  severity_threshold: low    # low | medium | high | critical
+  # enabled_categories: null # null = all categories. Or: [credentials, pii, crypto, infrastructure]
+
+  # Per-server overrides
+  servers:
+    github:
+      default_action: redact
+      severity_threshold: high
+
+  # Per-tool overrides (format: server_name.tool_name)
+  tools:
+    github.create_issue:
+      default_action: block
+      severity_threshold: high
+
+audit:
+  db_path: mcp-shield-audit.db
+  log_matched_text: false    # true = store matched text in clear; false = store hash
+  log_full_payload: false    # true = store full request/response payloads

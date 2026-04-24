@@ -1,0 +1,235 @@
+# MCP Shield - Default Regex Patterns Library
+# Each pattern: name, description, regex, severity, category
+# Patterns are tuned to minimize false positives over maximizing recall.
+
+---
+
+# =============================================================================
+# Cloud Credentials
+# =============================================================================
+
+- name: aws_access_key_id
+  description: >
+    AWS Access Key ID. Matches AKIA followed by exactly 16 alphanumeric
+    characters. Example: AKIAIOSFODNN7EXAMPLE
+  regex: 'AKIA[0-9A-Za-z]{16}'
+  severity: critical
+  category: credentials
+
+- name: aws_secret_access_key
+  description: >
+    AWS Secret Access Key. Matches a 40-character base64 string that follows
+    an assignment pattern (=, :, or quotes) to reduce false positives.
+    Example: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+  regex: '(?<=[=:"''])\s*[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])'
+  severity: critical
+  category: credentials
+
+- name: gcp_api_key
+  description: >
+    GCP API Key. Matches AIza followed by exactly 35 characters
+    (alphanumeric, hyphens, underscores).
+    Example: AIzaSyA1234567890abcdefghijklmnopqrstuv
+  regex: 'AIza[0-9A-Za-z\-_]{35}'
+  severity: critical
+  category: credentials
+
+- name: azure_storage_connection_string
+  description: >
+    Azure Storage Account connection string containing an AccountKey.
+    Example: DefaultEndpointsProtocol=https;AccountName=myacct;AccountKey=abc123==;EndpointSuffix=core.windows.net
+  regex: 'DefaultEndpointsProtocol=https?;AccountName=[^;]+;AccountKey=[A-Za-z0-9/+=]+'
+  severity: critical
+  category: credentials
+
+# =============================================================================
+# API Tokens
+# =============================================================================
+
+- name: github_pat
+  description: >
+    GitHub Personal Access Token or OAuth token. Matches ghp_, gho_, ghu_,
+    ghs_, or ghr_ prefixes followed by 36 alphanumeric/underscore characters.
+    Example: ghp_<36-char token>
+  regex: 'gh[pousr]_[0-9A-Za-z_]{36}'
+  severity: critical
+  category: credentials
+
+- name: gitlab_pat
+  description: >
+    GitLab Personal Access Token. Matches glpat- followed by 20 or more
+    alphanumeric/hyphen/underscore characters.
+    Example: glpat-<20+ char token>
+  regex: 'glpat-[0-9A-Za-z\-_]{20,}'
+  severity: critical
+  category: credentials
+
+- name: slack_bot_token
+  description: >
+    Slack Bot Token. Matches xoxb- followed by token segments.
+    Example: xoxb-<team-id>-<bot-id>-<token>
+  regex: 'xoxb-[0-9A-Za-z\-]{10,}'
+  severity: critical
+  category: credentials
+
+- name: slack_user_token
+  description: >
+    Slack User Token. Matches xoxp- followed by token segments.
+    Example: xoxp-<team-id>-<user-id>-<session>-<token>
+  regex: 'xoxp-[0-9A-Za-z\-]{10,}'
+  severity: critical
+  category: credentials
+
+- name: stripe_secret_key
+  description: >
+    Stripe Secret API Key (live mode). Matches sk_live_ followed by 24 or
+    more alphanumeric characters.
+    Example: sk_live_<24+ char secret>
+  regex: 'sk_live_[0-9A-Za-z]{24,}'
+  severity: critical
+  category: credentials
+
+- name: sendgrid_api_key
+  description: >
+    SendGrid API Key. Matches SG. followed by a base64-like token string.
+    Example: SG.abcDEF123456789.abcdefghijklmnopqrstuvwxyz0123456789ABCD
+  regex: 'SG\.[0-9A-Za-z\-_]{22,}\.[0-9A-Za-z\-_]{22,}'
+  severity: critical
+  category: credentials
+
+- name: bearer_token
+  description: >
+    Bearer token in HTTP Authorization header. Matches Bearer followed by a
+    token of 20+ characters (alphanumeric, hyphens, underscores, dots, tildes).
+    Example: Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9
+  regex: 'Bearer\s+[A-Za-z0-9\-._~+/]{20,}=*'
+  severity: critical
+  category: credentials
+
+# =============================================================================
+# Cryptographic Material
+# =============================================================================
+
+- name: rsa_private_key
+  description: >
+    RSA private key in PEM format.
+    Example: -----BEGIN RSA PRIVATE KEY-----
+  regex: '-----BEGIN RSA PRIVATE KEY-----'
+  severity: critical
+  category: crypto
+
+- name: ec_private_key
+  description: >
+    EC (Elliptic Curve) private key in PEM format.
+    Example: -----BEGIN EC PRIVATE KEY-----
+  regex: '-----BEGIN EC PRIVATE KEY-----'
+  severity: critical
+  category: crypto
+
+- name: generic_private_key
+  description: >
+    Generic private key in PEM format (PKCS#8).
+    Example: -----BEGIN PRIVATE KEY-----
+  regex: '-----BEGIN PRIVATE KEY-----'
+  severity: critical
+  category: crypto
+
+- name: pgp_private_key
+  description: >
+    PGP private key block.
+    Example: -----BEGIN PGP PRIVATE KEY BLOCK-----
+  regex: '-----BEGIN PGP PRIVATE KEY BLOCK-----'
+  severity: critical
+  category: crypto
+
+# =============================================================================
+# PII - Structured
+# =============================================================================
+
+- name: ssn
+  description: >
+    US Social Security Number in xxx-xx-xxxx format. Uses strict 3-2-4 digit
+    grouping with dashes to avoid matching phone numbers or other numeric
+    patterns. Excludes known invalid ranges (000, 666, 900-999 in area).
+    Example: 123-45-6789
+  regex: '(?<!\d)(?!000|666|9\d\d)\d{3}-(?!00)\d{2}-(?!0000)\d{4}(?!\d)'
+  severity: high
+  category: pii
+
+- name: credit_card_visa
+  description: >
+    Visa credit card number. Starts with 4, 13 or 16 digits total, with
+    optional spaces or hyphens as separators.
+    Example: 4111-1111-1111-1111
+  regex: '(?<!\d)4\d{3}[\s\-]?\d{4}[\s\-]?\d{4}[\s\-]?\d{1,4}(?!\d)'
+  severity: high
+  category: pii
+
+- name: credit_card_mastercard
+  description: >
+    Mastercard credit card number. Starts with 51-55, 16 digits total, with
+    optional spaces or hyphens as separators.
+    Example: 5500-0000-0000-0004
+  regex: '(?<!\d)5[1-5]\d{2}[\s\-]?\d{4}[\s\-]?\d{4}[\s\-]?\d{4}(?!\d)'
+  severity: high
+  category: pii
+
+- name: credit_card_amex
+  description: >
+    American Express credit card number. Starts with 34 or 37, 15 digits
+    total, with optional spaces or hyphens as separators.
+    Example: 3714-496353-98431
+  regex: '(?<!\d)3[47]\d{2}[\s\-]?\d{6}[\s\-]?\d{5}(?!\d)'
+  severity: high
+  category: pii
+
+- name: credit_card_discover
+  description: >
+    Discover credit card number. Starts with 6011 or 65, 16 digits total,
+    with optional spaces or hyphens as separators.
+    Example: 6011-1111-1111-1117
+  regex: '(?<!\d)(?:6011|65\d{2})[\s\-]?\d{4}[\s\-]?\d{4}[\s\-]?\d{4}(?!\d)'
+  severity: high
+  category: pii
+
+- name: us_phone_number
+  description: >
+    US phone number in common formats. Matches (xxx) xxx-xxxx, xxx-xxx-xxxx,
+    and +1xxxxxxxxxx variants. Requires a leading boundary to reduce false
+    positives.
+    Example: (555) 123-4567 or +15551234567
+  regex: '(?<!\d)(?:\+1[\s\-]?)?(?:\(\d{3}\)[\s\-]?|\d{3}[\s\-])\d{3}[\s\-]?\d{4}(?!\d)'
+  severity: high
+  category: pii
+
+# =============================================================================
+# Infrastructure
+# =============================================================================
+
+- name: database_connection_string
+  description: >
+    Database connection URI for common databases. Matches postgres://,
+    postgresql://, mysql://, mongodb://, and redis:// schemes followed by
+    connection details.
+    Example: postgresql://user:pass@localhost:5432/mydb
+  regex: '(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis)://[^\s''"]{10,}'
+  severity: high
+  category: infrastructure
+
+- name: generic_connection_string_with_password
+  description: >
+    Generic connection string with embedded credentials in the
+    user:password@host pattern. Matches any scheme.
+    Example: amqp://admin:s3cret@rabbitmq.internal:5672/vhost
+  regex: '\w+://[^:/@\s]+:[^:/@\s]+@[^/\s]+'
+  severity: high
+  category: infrastructure
+
+- name: jwt_token
+  description: >
+    JSON Web Token. Matches the eyJ prefix (base64-encoded JSON starting
+    with "{") followed by three base64url segments separated by dots.
+    Example: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U
+  regex: 'eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}'
+  severity: high
+  category: infrastructure
