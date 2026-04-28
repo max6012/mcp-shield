@@ -1,8 +1,9 @@
 """Policy configuration engine for MCP Shield.
 
-Loads a YAML config describing downstream servers, security policies, and
-audit settings.  Policies are resolved with three-level inheritance:
-tool_policies > server_policies > global_policy.
+Three concerns, separated:
+- LocalConfig: bootstrap config on disk (servers, audit, where to get policy)
+- Policy: security rules (global, per-server, per-tool) — loadable from disk or remote
+- GatewayConfig: assembled runtime config (LocalConfig + Policy)
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ import yaml
 # ------------------------------------------------------------------
 
 class PolicyAction(enum.Enum):
-    """Actions that the gateway can take when a pattern matches."""
+    """Actions the gateway can take when a pattern matches."""
 
     BLOCK = "block"
     REDACT = "redact"
@@ -49,7 +50,7 @@ def _validate_severity(value: str) -> str:
 
 
 # ------------------------------------------------------------------
-# Data classes
+# PolicyRule
 # ------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -66,38 +67,74 @@ class PolicyRule:
         _validate_severity(self.severity_threshold)
 
 
+# ------------------------------------------------------------------
+# Policy — security rules, independently loadable / remotely fetchable
+# ------------------------------------------------------------------
+
 @dataclass
-class GatewayConfig:
-    """Top-level gateway configuration."""
+class Policy:
+    """Security rules for the gateway. Decoupled from deployment config so it
+    can be loaded from a local file or fetched from a remote endpoint."""
+
+    global_rule: PolicyRule
+    server_rules: dict[str, PolicyRule] = field(default_factory=dict)
+    tool_rules: dict[str, PolicyRule] = field(default_factory=dict)
+
+    def resolve(self, server_name: str, tool_name: str) -> PolicyRule:
+        """Return the effective rule for server_name / tool_name.
+
+        Resolution order (most specific wins):
+          1. tool_rules   (key = "server.tool")
+          2. server_rules
+          3. global_rule
+        """
+        fq_tool = f"{server_name}.{tool_name}"
+        if fq_tool in self.tool_rules:
+            return self.tool_rules[fq_tool]
+        if server_name in self.server_rules:
+            return self.server_rules[server_name]
+        return self.global_rule
+
+
+# ------------------------------------------------------------------
+# LocalConfig — bootstrap config, lives on disk, user-editable
+# ------------------------------------------------------------------
+
+@dataclass
+class LocalConfig:
+    """Bootstrap configuration: which servers to connect to, where to write
+    audit records, and optionally where to fetch policy from."""
 
     downstream_servers: dict[str, dict[str, Any]]
-    global_policy: PolicyRule
-    server_policies: dict[str, PolicyRule] = field(default_factory=dict)
-    tool_policies: dict[str, PolicyRule] = field(default_factory=dict)
     audit: dict[str, Any] = field(default_factory=lambda: {
         "db_path": "mcp-shield-audit.db",
         "log_matched_text": False,
         "log_full_payload": False,
     })
+    policy_source: str | None = None  # URL or path; None = use inline policy from YAML
 
-    # ------------------------------------------------------------------
-    # Policy resolution
-    # ------------------------------------------------------------------
+
+# ------------------------------------------------------------------
+# GatewayConfig — assembled runtime config
+# ------------------------------------------------------------------
+
+@dataclass
+class GatewayConfig:
+    """Runtime gateway config: LocalConfig + Policy combined."""
+
+    local: LocalConfig
+    policy: Policy
+
+    @property
+    def downstream_servers(self) -> dict[str, dict[str, Any]]:
+        return self.local.downstream_servers
+
+    @property
+    def audit(self) -> dict[str, Any]:
+        return self.local.audit
 
     def resolve_policy(self, server_name: str, tool_name: str) -> PolicyRule:
-        """Return the effective policy for *server_name* / *tool_name*.
-
-        Resolution order (most specific wins):
-          1. tool_policies  (key = "server.tool")
-          2. server_policies
-          3. global_policy
-        """
-        fq_tool = f"{server_name}.{tool_name}"
-        if fq_tool in self.tool_policies:
-            return self.tool_policies[fq_tool]
-        if server_name in self.server_policies:
-            return self.server_policies[server_name]
-        return self.global_policy
+        return self.policy.resolve(server_name, tool_name)
 
 
 # ------------------------------------------------------------------
@@ -105,7 +142,6 @@ class GatewayConfig:
 # ------------------------------------------------------------------
 
 def _parse_policy_rule(raw: dict[str, Any]) -> PolicyRule:
-    """Build a PolicyRule from a raw YAML dict."""
     return PolicyRule(
         action=raw.get("default_action", "log"),
         severity_threshold=raw.get("severity_threshold", "low"),
@@ -114,8 +150,23 @@ def _parse_policy_rule(raw: dict[str, Any]) -> PolicyRule:
     )
 
 
+def load_policy_from_dict(raw: dict[str, Any]) -> Policy:
+    """Build a Policy from a raw dict (YAML section or remote fetch response)."""
+    return Policy(
+        global_rule=_parse_policy_rule(raw),
+        server_rules={
+            name: _parse_policy_rule(srv)
+            for name, srv in raw.get("servers", {}).items()
+        },
+        tool_rules={
+            name: _parse_policy_rule(tool)
+            for name, tool in raw.get("tools", {}).items()
+        },
+    )
+
+
 def load_config(path: str | Path) -> GatewayConfig:
-    """Read a YAML configuration file and return a ``GatewayConfig``."""
+    """Read a YAML configuration file and return a GatewayConfig."""
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {path}")
@@ -124,38 +175,22 @@ def load_config(path: str | Path) -> GatewayConfig:
     if not isinstance(raw, dict):
         raise ValueError("Config YAML must be a mapping at the top level")
 
-    # --- downstream servers ---
     if "downstream_servers" not in raw:
         raise ValueError("Config must contain a 'downstream_servers' section")
-    downstream_servers: dict[str, dict[str, Any]] = raw["downstream_servers"]
 
-    # --- policy ---
+    audit_raw = raw.get("audit", {})
+    local = LocalConfig(
+        downstream_servers=raw["downstream_servers"],
+        audit={
+            "db_path": audit_raw.get("db_path", "mcp-shield-audit.db"),
+            "log_matched_text": audit_raw.get("log_matched_text", False),
+            "log_full_payload": audit_raw.get("log_full_payload", False),
+        },
+        policy_source=raw.get("policy_source"),
+    )
+
     policy_raw = raw.get("policy", {})
     if not isinstance(policy_raw, dict):
         raise ValueError("'policy' section must be a mapping")
 
-    global_policy = _parse_policy_rule(policy_raw)
-
-    server_policies: dict[str, PolicyRule] = {}
-    for name, srv_raw in policy_raw.get("servers", {}).items():
-        server_policies[name] = _parse_policy_rule(srv_raw)
-
-    tool_policies: dict[str, PolicyRule] = {}
-    for name, tool_raw in policy_raw.get("tools", {}).items():
-        tool_policies[name] = _parse_policy_rule(tool_raw)
-
-    # --- audit ---
-    audit_raw = raw.get("audit", {})
-    audit = {
-        "db_path": audit_raw.get("db_path", "mcp-shield-audit.db"),
-        "log_matched_text": audit_raw.get("log_matched_text", False),
-        "log_full_payload": audit_raw.get("log_full_payload", False),
-    }
-
-    return GatewayConfig(
-        downstream_servers=downstream_servers,
-        global_policy=global_policy,
-        server_policies=server_policies,
-        tool_policies=tool_policies,
-        audit=audit,
-    )
+    return GatewayConfig(local=local, policy=load_policy_from_dict(policy_raw))

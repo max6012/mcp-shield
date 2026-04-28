@@ -9,9 +9,12 @@ import pytest
 
 from mcp_shield.policy import (
     GatewayConfig,
+    LocalConfig,
+    Policy,
     PolicyAction,
     PolicyRule,
     load_config,
+    load_policy_from_dict,
 )
 
 
@@ -86,23 +89,23 @@ class TestLoadConfig:
 
     def test_loads_global_policy(self, config_file: Path) -> None:
         cfg = load_config(config_file)
-        assert cfg.global_policy.action == "log"
-        assert cfg.global_policy.severity_threshold == "low"
-        assert cfg.global_policy.enabled_categories is None
+        assert cfg.policy.global_rule.action == "log"
+        assert cfg.policy.global_rule.severity_threshold == "low"
+        assert cfg.policy.global_rule.enabled_categories is None
 
     def test_loads_server_policy(self, config_file: Path) -> None:
         cfg = load_config(config_file)
-        assert "filesystem" in cfg.server_policies
-        fs_policy = cfg.server_policies["filesystem"]
-        assert fs_policy.action == "redact"
-        assert fs_policy.severity_threshold == "medium"
+        assert "filesystem" in cfg.policy.server_rules
+        fs_rule = cfg.policy.server_rules["filesystem"]
+        assert fs_rule.action == "redact"
+        assert fs_rule.severity_threshold == "medium"
 
     def test_loads_tool_policy(self, config_file: Path) -> None:
         cfg = load_config(config_file)
-        assert "github.create_issue" in cfg.tool_policies
-        tool_policy = cfg.tool_policies["github.create_issue"]
-        assert tool_policy.action == "block"
-        assert tool_policy.severity_threshold == "high"
+        assert "github.create_issue" in cfg.policy.tool_rules
+        tool_rule = cfg.policy.tool_rules["github.create_issue"]
+        assert tool_rule.action == "block"
+        assert tool_rule.severity_threshold == "high"
 
     def test_loads_audit_settings(self, config_file: Path) -> None:
         cfg = load_config(config_file)
@@ -138,36 +141,69 @@ class TestLoadConfig:
         with pytest.raises(ValueError, match="Invalid action"):
             load_config(bad)
 
+    def test_policy_source_loaded(self, tmp_path: Path) -> None:
+        p = tmp_path / "config.yaml"
+        p.write_text(textwrap.dedent("""\
+            downstream_servers:
+              s1:
+                command: echo
+            policy_source: https://policy.example.com/policy.json
+            policy:
+              default_action: log
+        """))
+        cfg = load_config(p)
+        assert cfg.local.policy_source == "https://policy.example.com/policy.json"
+
+    def test_policy_source_defaults_to_none(self, config_file: Path) -> None:
+        cfg = load_config(config_file)
+        assert cfg.local.policy_source is None
+
+
+class TestPolicy:
+    def test_load_policy_from_dict(self) -> None:
+        raw = {
+            "default_action": "redact",
+            "severity_threshold": "medium",
+            "servers": {
+                "s1": {"default_action": "block", "severity_threshold": "high"},
+            },
+            "tools": {
+                "s1.t1": {"default_action": "log"},
+            },
+        }
+        policy = load_policy_from_dict(raw)
+        assert policy.global_rule.action == "redact"
+        assert policy.server_rules["s1"].action == "block"
+        assert policy.tool_rules["s1.t1"].action == "log"
+
 
 class TestResolvePolicy:
     def test_global_default_when_no_override(self, config_file: Path) -> None:
         cfg = load_config(config_file)
-        # "github" server, "list_repos" tool — no overrides exist
         policy = cfg.resolve_policy("github", "list_repos")
         assert policy.action == "log"
         assert policy.severity_threshold == "low"
 
     def test_server_override_takes_precedence(self, config_file: Path) -> None:
         cfg = load_config(config_file)
-        # "filesystem" has a server-level override; "read_file" has no tool override
         policy = cfg.resolve_policy("filesystem", "read_file")
         assert policy.action == "redact"
         assert policy.severity_threshold == "medium"
 
     def test_tool_override_takes_precedence(self, config_file: Path) -> None:
         cfg = load_config(config_file)
-        # "github.create_issue" has a tool-level override
         policy = cfg.resolve_policy("github", "create_issue")
         assert policy.action == "block"
         assert policy.severity_threshold == "high"
 
     def test_tool_override_beats_server_override(self) -> None:
-        """Tool policy wins even when a server policy also exists."""
         cfg = GatewayConfig(
-            downstream_servers={"s": {"command": "echo"}},
-            global_policy=PolicyRule(action="log"),
-            server_policies={"s": PolicyRule(action="redact")},
-            tool_policies={"s.t": PolicyRule(action="block", severity_threshold="critical")},
+            local=LocalConfig(downstream_servers={"s": {"command": "echo"}}),
+            policy=Policy(
+                global_rule=PolicyRule(action="log"),
+                server_rules={"s": PolicyRule(action="redact")},
+                tool_rules={"s.t": PolicyRule(action="block", severity_threshold="critical")},
+            ),
         )
         policy = cfg.resolve_policy("s", "t")
         assert policy.action == "block"

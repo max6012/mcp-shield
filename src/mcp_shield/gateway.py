@@ -291,8 +291,8 @@ def create_server(gateway: ShieldGateway) -> Server:
 
 def _resolve_patterns_path(config: GatewayConfig) -> Path:
     """Find the patterns file — custom from global policy, or the built-in default."""
-    if config.global_policy.custom_patterns_file:
-        return Path(config.global_policy.custom_patterns_file)
+    if config.policy.global_rule.custom_patterns_file:
+        return Path(config.policy.global_rule.custom_patterns_file)
     return Path(__file__).parent / "patterns" / "default_patterns.yaml"
 
 

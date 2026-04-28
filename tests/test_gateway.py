@@ -13,7 +13,7 @@ import pytest
 from mcp.types import CallToolResult, TextContent, Tool
 
 from mcp_shield.gateway import ShieldGateway, create_server
-from mcp_shield.policy import GatewayConfig, PolicyRule
+from mcp_shield.policy import GatewayConfig, LocalConfig, Policy, PolicyRule
 from mcp_shield.scanner import Scanner
 
 
@@ -43,13 +43,19 @@ def scanner(tmp_path):
     return Scanner(p)
 
 
-def _make_config(**overrides) -> GatewayConfig:
-    defaults = dict(
-        downstream_servers={},
-        global_policy=PolicyRule(action="log"),
+def _make_config(
+    global_policy: PolicyRule | None = None,
+    server_policies: dict | None = None,
+    tool_policies: dict | None = None,
+) -> GatewayConfig:
+    return GatewayConfig(
+        local=LocalConfig(downstream_servers={}),
+        policy=Policy(
+            global_rule=global_policy or PolicyRule(action="log"),
+            server_rules=server_policies or {},
+            tool_rules=tool_policies or {},
+        ),
     )
-    defaults.update(overrides)
-    return GatewayConfig(**defaults)
 
 
 def _make_gateway_with_fake_downstream(
