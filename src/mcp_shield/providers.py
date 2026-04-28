@@ -104,8 +104,10 @@ class RemotePolicyProvider:
                 continue
 
             if resp.status_code == 304:
+                if self._cached_policy is None:
+                    raise RemotePolicyError("Received 304 Not Modified but no cached policy exists")
                 log.debug("Policy unchanged (304 Not Modified), using cached policy")
-                return self._cached_policy  # type: ignore[return-value]  # guaranteed by If-None-Match guard above
+                return self._cached_policy
 
             if resp.status_code == 200:
                 etag = resp.headers.get("ETag")

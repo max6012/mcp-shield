@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from mcp.types import CallToolResult, TextContent, Tool
 
-from mcp_shield.gateway import ShieldGateway, create_server
+from mcp_shield.gateway import ShieldGateway, _resolve_patterns_path, create_server
 from mcp_shield.policy import GatewayConfig, LocalConfig, Policy, PolicyRule
 from mcp_shield.scanner import Scanner
 
@@ -342,3 +342,27 @@ class TestNoScanner:
             {"query": "key is AKIAIOSFODNN7EXAMPLE"},
         )
         assert result.isError is False
+
+
+# ------------------------------------------------------------------
+# _resolve_patterns_path
+# ------------------------------------------------------------------
+
+class TestResolvePatternsPath:
+
+    def test_returns_default_when_no_custom_file(self) -> None:
+        config = _make_config()
+        path = _resolve_patterns_path(config)
+        assert path.name == "default_patterns.yaml"
+        assert path.exists()
+
+    def test_returns_custom_path_when_set(self, tmp_path) -> None:
+        custom = tmp_path / "my_patterns.yaml"
+        custom.touch()
+        config = GatewayConfig(
+            local=LocalConfig(downstream_servers={}),
+            policy=Policy(
+                global_rule=PolicyRule(action="log", custom_patterns_file=str(custom)),
+            ),
+        )
+        assert _resolve_patterns_path(config) == custom

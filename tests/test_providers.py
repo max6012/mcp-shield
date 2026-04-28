@@ -308,6 +308,132 @@ class TestMakePolicyProvider:
 
 
 # ------------------------------------------------------------------
+# RemotePolicyProvider — edge cases
+# ------------------------------------------------------------------
+
+class TestRemotePolicyProviderEdgeCases:
+
+    @pytest.mark.anyio
+    async def test_304_without_cached_policy_raises(self) -> None:
+        """Server sends 304 but we never cached a policy — should raise RemotePolicyError."""
+        patcher, _ = _mock_http_client(304)
+        with patcher:
+            provider = RemotePolicyProvider("https://example.com/p")
+            with pytest.raises(RemotePolicyError, match="304 Not Modified but no cached policy"):
+                await provider.fetch()
+
+    @pytest.mark.anyio
+    async def test_429_raises_immediately_without_retry(self) -> None:
+        """HTTP 429 (rate limit) is a 4xx — should raise immediately, no retry."""
+        patcher, mock_client = _mock_http_client(429, {})
+        with patcher:
+            with pytest.raises(RemotePolicyError, match="HTTP 429"):
+                await RemotePolicyProvider("https://example.com/p").fetch()
+        assert mock_client.get.call_count == 1
+
+    @pytest.mark.anyio
+    async def test_200_with_new_etag_updates_cached_etag(self) -> None:
+        """Two sequential 200s with different ETags — etag should update each time."""
+        provider = RemotePolicyProvider("https://example.com/p")
+
+        patcher1, _ = _mock_http_client(200, POLICY_DICT, etag='"v1"')
+        with patcher1:
+            await provider.fetch()
+        assert provider._etag == '"v1"'
+
+        updated_dict = {**POLICY_DICT, "default_action": "block"}
+        patcher2, _ = _mock_http_client(200, updated_dict, etag='"v2"')
+        with patcher2:
+            policy = await provider.fetch()
+        assert provider._etag == '"v2"'
+        assert policy.global_rule.action == "block"
+
+    @pytest.mark.anyio
+    async def test_malformed_json_propagates(self) -> None:
+        """A 200 response with non-JSON body raises — not swallowed as RemotePolicyError."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {}
+        mock_resp.json = MagicMock(side_effect=ValueError("not JSON"))
+
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(return_value=mock_resp)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("mcp_shield.providers.httpx.AsyncClient", return_value=mock_client):
+            with pytest.raises(ValueError, match="not JSON"):
+                await RemotePolicyProvider("https://example.com/p").fetch()
+
+
+# ------------------------------------------------------------------
+# Integration: load_config + make_policy_provider
+# ------------------------------------------------------------------
+
+class TestConfigProviderIntegration:
+
+    def test_policy_source_url_produces_remote_provider(self, tmp_path: Path) -> None:
+        from mcp_shield.policy import load_config
+        from mcp_shield.providers import RemotePolicyProvider, make_policy_provider
+        import textwrap
+
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text(textwrap.dedent("""\
+            downstream_servers:
+              s1:
+                command: echo
+            policy_source: https://policy.example.com/policy.json
+            policy:
+              default_action: log
+        """))
+        cfg = load_config(cfg_file)
+        provider = make_policy_provider(cfg.local.policy_source)
+        assert isinstance(provider, RemotePolicyProvider)
+        assert provider.url == "https://policy.example.com/policy.json"
+
+    def test_policy_source_path_produces_file_provider(self, tmp_path: Path) -> None:
+        from mcp_shield.policy import load_config
+        from mcp_shield.providers import FilePolicyProvider, make_policy_provider
+        import textwrap
+
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text(textwrap.dedent("""\
+            downstream_servers:
+              s1:
+                command: echo
+            policy_source: /etc/mcp-shield/policy.yaml
+            policy:
+              default_action: log
+        """))
+        cfg = load_config(cfg_file)
+        provider = make_policy_provider(cfg.local.policy_source)
+        assert isinstance(provider, FilePolicyProvider)
+
+    @pytest.mark.anyio
+    async def test_file_provider_policy_resolves_correctly(self, tmp_path: Path) -> None:
+        """Policy loaded via FilePolicyProvider resolves server/tool overrides end-to-end."""
+        policy_file = tmp_path / "policy.yaml"
+        policy_file.write_text(textwrap.dedent("""\
+            default_action: log
+            servers:
+              github:
+                default_action: redact
+            tools:
+              github.create_issue:
+                default_action: block
+                severity_threshold: high
+        """))
+
+        from mcp_shield.providers import FilePolicyProvider
+        policy = await FilePolicyProvider(policy_file).fetch()
+
+        assert policy.resolve("other", "any_tool").action == "log"
+        assert policy.resolve("github", "list_repos").action == "redact"
+        assert policy.resolve("github", "create_issue").action == "block"
+        assert policy.resolve("github", "create_issue").severity_threshold == "high"
+
+
+# ------------------------------------------------------------------
 # Protocol conformance
 # ------------------------------------------------------------------
 

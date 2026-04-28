@@ -11,21 +11,27 @@ Working MVP. Handles stdio-transport MCP servers end-to-end.
 - Policy engine with three-level inheritance (tool > server > global), severity thresholds, category filters
 - `block` / `redact` / `log` actions applied to both requests and responses
 - SQLite audit log with configurable payload and plaintext capture
-- 47 tests passing
+- `PolicyProvider` abstraction separates local bootstrap config from security policy — policy is independently loadable from a local file or a remote HTTPS endpoint
+- Remote policy fetch with X-API-Key auth, ETag caching, and retry/backoff
+- 86 tests passing
 
 ## Roadmap
 
 ### v0.2 — Centralized policy and deployment
 
-- Separate local bootstrap config from centrally-managed policy
-- Remote policy fetch over HTTPS with API-key auth, local cache, configurable fail-open / fail-closed fallback
-- Periodic refresh with ETag support (4 hour default)
+- ~~Separate local bootstrap config from centrally-managed policy~~ ✓
+- ~~Remote policy fetch over HTTPS with API-key auth, ETag support, retry/backoff~~ ✓
+- Local policy cache (survives process restarts), configurable fail-open / fail-closed fallback
+- Periodic background refresh (4 hour default)
 - Auto-discovery of downstream MCP servers from the universal `mcpServers` config schema
 - Deployment guide covering MDM integration and the threat model boundaries
 
 ### Backlog
 
 - Cryptographic signing of policy responses (defense against user-controlled MITM)
+- SIEM forwarding for audit events
+- Behavioral hard-stops beyond payload matching (rate limits, repeated blocked calls)
+- Usage report / policy tuning mode
 
 ## License
 
