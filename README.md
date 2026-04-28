@@ -15,6 +15,28 @@ Working MVP. Handles stdio-transport MCP servers end-to-end.
 - Remote policy fetch with X-API-Key auth, ETag caching, and retry/backoff
 - 86 tests passing
 
+## Threat model
+
+### What MCP Shield stops
+
+- **Credential exfiltration through tool responses.** A filesystem MCP server returns a `.env` file; a database server echoes a connection string back in an error message. MCP Shield intercepts the response before it reaches the AI client and redacts or blocks it.
+- **Credentials sent into tool calls.** A user pastes an API key into a prompt; the AI client forwards it as a tool argument. MCP Shield scans outbound arguments and can block or redact before the downstream server sees them.
+- **PII flowing through MCP traffic.** SSNs, credit card numbers, and phone numbers in either direction.
+- **Policy-driven enforcement without per-server configuration.** A centrally managed policy applies uniformly across all downstream servers — no per-tool opt-in required.
+
+### What MCP Shield does not stop
+
+- **Supply chain attacks against MCP Shield itself.** If the `mcp-shield` package or any of its dependencies (`mcp`, `httpx`, `pyyaml`) is compromised, the gateway becomes the attacker's foothold with access to every credential that flows through it. Pin dependencies to cryptographic hashes in production. (See the [LiteLLM supply chain compromise](https://www.trendmicro.com/en_us/research/26/c/inside-litellm-supply-chain-compromise.html) for the exact attack class.)
+- **Unknown or encoded credential formats.** Patterns match what they are written for. A base64-encoded secret, a custom token format, or a credential split across multiple fields will not be caught.
+- **Prompt injection.** MCP Shield is a regex scanner, not a semantic analyzer. It cannot detect instructions embedded in tool output designed to manipulate the AI client's subsequent behavior.
+- **A malicious downstream MCP server.** MCP Shield trusts the servers listed in its config. If a downstream server is itself compromised or adversarial, MCP Shield will proxy its calls faithfully, subject only to pattern matches on the traffic content.
+- **Policy endpoint compromise.** If the remote policy source is tampered with, an attacker can silently weaken enforcement (e.g., flip all rules to `log`). Cryptographic signing of policy responses is in the backlog; until then, treat the policy endpoint as a high-value target.
+- **Credentials that never appear in tool call text.** Secrets injected at the OS or container level, or passed through side channels outside the MCP protocol, are invisible to the gateway.
+
+### Trust boundaries
+
+MCP Shield trusts its own process and config. Everything in tool call traffic — arguments, responses, server names — is untrusted input. The policy source (local file or remote endpoint) is trusted by configuration; securing it is the operator's responsibility.
+
 ## Roadmap
 
 ### v0.2 — Centralized policy and deployment
