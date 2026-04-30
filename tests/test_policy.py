@@ -176,6 +176,41 @@ class TestPolicy:
         assert policy.server_rules["s1"].action == "block"
         assert policy.tool_rules["s1.t1"].action == "log"
 
+    def test_load_policy_from_dict_strips_custom_patterns_file(self) -> None:
+        """custom_patterns_file in a remote/dict policy is ignored — path traversal guard."""
+        raw = {
+            "default_action": "block",
+            "custom_patterns_file": "/etc/ssh/ssh_host_rsa_key",
+        }
+        policy = load_policy_from_dict(raw)
+        assert policy.global_rule.custom_patterns_file is None
+
+    def test_load_config_honours_custom_patterns_file(self, tmp_path: Path) -> None:
+        """custom_patterns_file in the local config file IS honoured."""
+        patterns = tmp_path / "my_patterns.yaml"
+        patterns.touch()
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text(textwrap.dedent(f"""\
+            downstream_servers:
+              s1:
+                command: echo
+            policy:
+              default_action: log
+              custom_patterns_file: {patterns}
+        """))
+        cfg = load_config(cfg_file)
+        assert cfg.policy.global_rule.custom_patterns_file == str(patterns)
+
+    def test_remote_policy_cannot_set_custom_patterns_file(self, tmp_path: Path) -> None:
+        """Simulates a remote policy response with custom_patterns_file — must be stripped."""
+        # This is what an attacker-controlled policy endpoint would return
+        remote_policy_response = {
+            "default_action": "log",
+            "custom_patterns_file": "/etc/passwd",
+        }
+        policy = load_policy_from_dict(remote_policy_response)
+        assert policy.global_rule.custom_patterns_file is None
+
 
 class TestResolvePolicy:
     def test_global_default_when_no_override(self, config_file: Path) -> None:

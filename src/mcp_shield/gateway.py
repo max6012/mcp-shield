@@ -8,7 +8,6 @@ all tool calls. The scanner/policy integration happens in the call_tool path.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import sys
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -19,7 +18,7 @@ from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import CallToolResult, TextContent, Tool
+from mcp.types import CallToolResult, EmbeddedResource, TextContent, TextResourceContents, Tool
 
 from mcp_shield.audit import AuditLog
 from mcp_shield.policy import GatewayConfig, PolicyRule, _SEVERITY_RANK, load_config
@@ -82,6 +81,11 @@ class ShieldGateway:
     async def start(self) -> None:
         """Connect to all downstream servers and build the tool map."""
         for srv_name, srv_conf in self.config.downstream_servers.items():
+            if "__" in srv_name:
+                raise ValueError(
+                    f"Server name {srv_name!r} contains '__', which is reserved as the "
+                    "namespace separator. Rename the server in your config."
+                )
             params = StdioServerParameters(
                 command=srv_conf["command"],
                 args=srv_conf.get("args", []),
@@ -92,6 +96,11 @@ class ShieldGateway:
             self.downstream[srv_name] = ds
 
             for tool in ds.tools:
+                if "__" in tool.name:
+                    raise ValueError(
+                        f"Tool name {tool.name!r} from server {srv_name!r} contains '__', "
+                        "which is reserved as the namespace separator."
+                    )
                 namespaced = f"{srv_name}__{tool.name}"
                 self._tool_map[namespaced] = (srv_name, tool.name)
 
@@ -151,8 +160,8 @@ class ShieldGateway:
 
                 if action == "block":
                     if self.audit:
-                        self.audit.record(srv_name, original_name, "request", "block",
-                                          matches=req_matches, payload=arguments)
+                        await self.audit.record(srv_name, original_name, "request", "block",
+                                                matches=req_matches, payload=arguments)
                     return CallToolResult(
                         content=[TextContent(
                             type="text",
@@ -162,17 +171,26 @@ class ShieldGateway:
                     )
                 if action == "redact":
                     if self.audit:
-                        self.audit.record(srv_name, original_name, "request", "redact",
-                                          matches=req_matches, payload=arguments)
+                        await self.audit.record(srv_name, original_name, "request", "redact",
+                                                matches=req_matches, payload=arguments)
                     arguments = self._redact_json(arguments, req_matches)
                 else:
                     # action == "log"
                     if self.audit:
-                        self.audit.record(srv_name, original_name, "request", "log",
-                                          matches=req_matches, payload=arguments)
+                        await self.audit.record(srv_name, original_name, "request", "log",
+                                                matches=req_matches, payload=arguments)
+            elif self.audit:
+                await self.audit.record(srv_name, original_name, "request", "pass")
 
         # --- Forward to downstream ---
-        result = await ds.session.call_tool(original_name, arguments)
+        try:
+            result = await ds.session.call_tool(original_name, arguments)
+        except Exception as exc:
+            log.warning("call_tool %s.%s raised: %s", srv_name, original_name, exc)
+            return CallToolResult(
+                content=[TextContent(type="text", text=f"Tool call failed: {exc}")],
+                isError=True,
+            )
 
         # --- Scan response ---
         if self.scanner and result.content:
@@ -191,8 +209,8 @@ class ShieldGateway:
 
                     if policy.action == "block":
                         if self.audit:
-                            self.audit.record(srv_name, original_name, "response", "block",
-                                              matches=resp_matches)
+                            await self.audit.record(srv_name, original_name, "response", "block",
+                                                    matches=resp_matches)
                         return CallToolResult(
                             content=[TextContent(
                                 type="text",
@@ -202,13 +220,15 @@ class ShieldGateway:
                         )
                     if policy.action == "redact":
                         if self.audit:
-                            self.audit.record(srv_name, original_name, "response", "redact",
-                                              matches=resp_matches)
+                            await self.audit.record(srv_name, original_name, "response", "redact",
+                                                    matches=resp_matches)
                         result = self._redact_response(result, resp_matches)
                     else:
                         if self.audit:
-                            self.audit.record(srv_name, original_name, "response", "log",
-                                              matches=resp_matches)
+                            await self.audit.record(srv_name, original_name, "response", "log",
+                                                    matches=resp_matches)
+                elif self.audit:
+                    await self.audit.record(srv_name, original_name, "response", "pass")
 
         return result
 
@@ -225,21 +245,32 @@ class ShieldGateway:
         return filtered
 
     def _redact_json(self, data: Any, matches: list[Match]) -> Any:
-        """Redact matched text in a JSON-like structure by replacing with placeholders."""
-        text = json.dumps(data)
-        for m in sorted(matches, key=lambda x: -len(x.matched_text)):
-            text = text.replace(m.matched_text, f"[REDACTED:{m.category}]")
-        return json.loads(text)
+        """Redact matched text in a JSON-like structure by walking leaf strings."""
+        if isinstance(data, str):
+            return _redact_string(data, matches)
+        if isinstance(data, dict):
+            return {k: self._redact_json(v, matches) for k, v in data.items()}
+        if isinstance(data, list):
+            return [self._redact_json(item, matches) for item in data]
+        return data
 
     def _redact_response(self, result: CallToolResult, matches: list[Match]) -> CallToolResult:
         """Return a new CallToolResult with matched text redacted."""
         new_content = []
         for content in result.content:
             if isinstance(content, TextContent):
-                text = content.text
-                for m in sorted(matches, key=lambda x: -len(x.matched_text)):
-                    text = text.replace(m.matched_text, f"[REDACTED:{m.category}]")
-                new_content.append(TextContent(type="text", text=text))
+                new_content.append(
+                    TextContent(type="text", text=_redact_string(content.text, matches))
+                )
+            elif isinstance(content, EmbeddedResource):
+                resource = content.resource
+                if isinstance(resource, TextResourceContents) and resource.text:
+                    resource = resource.model_copy(
+                        update={"text": _redact_string(resource.text, matches)}
+                    )
+                    new_content.append(EmbeddedResource(type="resource", resource=resource))
+                else:
+                    new_content.append(content)
             else:
                 new_content.append(content)
         return CallToolResult(content=new_content, isError=result.isError)
@@ -248,13 +279,44 @@ class ShieldGateway:
         await self._stack.aclose()
 
 
+def _redact_string(text: str, matches: list[Match]) -> str:
+    """Replace each match's exact text with a [REDACTED:category] placeholder.
+
+    Applies replacements longest-first to avoid a shorter match clobbering
+    part of a longer one before the longer one gets a chance to replace.
+    Operates on the raw string value, never on serialized JSON, so JSON
+    delimiters and escape sequences in the surrounding payload are safe.
+    """
+    for m in sorted(matches, key=lambda x: -len(x.matched_text)):
+        text = text.replace(m.matched_text, f"[REDACTED:{m.category}]")
+    return text
+
+
+_SCAN_SIZE_LIMIT = 1_048_576  # 1 MB — responses larger than this are truncated before scanning
+
+
 def _extract_text(result: CallToolResult) -> str:
-    """Extract all text content from a CallToolResult."""
+    """Extract all scannable text content from a CallToolResult.
+
+    Caps output at _SCAN_SIZE_LIMIT bytes to prevent large responses from
+    blocking the asyncio event loop during regex scanning.
+    """
     parts = []
     for content in result.content:
         if isinstance(content, TextContent):
             parts.append(content.text)
-    return "\n".join(parts)
+        elif isinstance(content, EmbeddedResource):
+            resource = content.resource
+            if isinstance(resource, TextResourceContents) and resource.text:
+                parts.append(resource.text)
+    text = "\n".join(parts)
+    if len(text.encode()) > _SCAN_SIZE_LIMIT:
+        log.warning(
+            "Response payload exceeds scan limit (%d bytes > %d); truncating before scan",
+            len(text.encode()), _SCAN_SIZE_LIMIT,
+        )
+        text = text.encode()[:_SCAN_SIZE_LIMIT].decode(errors="ignore")
+    return text
 
 
 # ------------------------------------------------------------------
@@ -278,7 +340,7 @@ def create_server(gateway: ShieldGateway) -> Server:
     async def list_tools() -> list[Tool]:
         return gateway.get_aggregated_tools()
 
-    @server.call_tool(validate_input=False)
+    @server.call_tool()
     async def call_tool(name: str, arguments: dict[str, Any]) -> CallToolResult:
         return await gateway.proxy_call(name, arguments)
 
@@ -305,6 +367,25 @@ def run_gateway(config_path: str) -> None:
     )
 
     config = load_config(config_path)
+
+    # If a policy_source is configured, fetch the live policy and replace the
+    # inline bootstrap policy from the config file.
+    if config.local.policy_source:
+        from mcp_shield.providers import PolicyCache, make_policy_provider
+
+        provider = make_policy_provider(
+            config.local.policy_source,
+            cache=PolicyCache(),
+        )
+        log.info("Fetching policy from %s", config.local.policy_source)
+
+        async def _fetch_policy():
+            return await provider.fetch()
+
+        live_policy = asyncio.run(_fetch_policy())
+        config = GatewayConfig(local=config.local, policy=live_policy)
+        log.info("Live policy loaded (global action: %s)", live_policy.global_rule.action)
+
     patterns_path = _resolve_patterns_path(config)
     scanner = Scanner(patterns_path)
     log.info("Loaded %d patterns from %s", len(scanner.patterns), patterns_path)

@@ -2,16 +2,21 @@
 
 FilePolicyProvider   — loads Policy from a local YAML file.
 RemotePolicyProvider — fetches Policy over HTTPS with ETag caching and retry/backoff.
+PolicyCache          — persists fetched policy to disk so ETag survives restarts.
 make_policy_provider — factory: https?:// URL → Remote, anything else → File.
 """
 
 from __future__ import annotations
 
 import asyncio
+import ipaddress
+import json
 import logging
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol, runtime_checkable
+from urllib.parse import urlparse
 
 import httpx
 import yaml
@@ -27,6 +32,99 @@ _REQUEST_TIMEOUT = 10.0
 
 class RemotePolicyError(Exception):
     """Raised when a remote policy fetch fails unrecoverably."""
+
+
+# ------------------------------------------------------------------
+# URL safety validation
+# ------------------------------------------------------------------
+
+_PRIVATE_NETWORKS = [
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("127.0.0.0/8"),       # loopback
+    ipaddress.ip_network("169.254.0.0/16"),    # link-local (AWS IMDS, etc.)
+    ipaddress.ip_network("::1/128"),           # IPv6 loopback
+    ipaddress.ip_network("fc00::/7"),          # IPv6 unique local
+    ipaddress.ip_network("fe80::/10"),         # IPv6 link-local
+]
+
+
+def _validate_policy_url(url: str) -> None:
+    """Raise ValueError if url targets a non-public or non-http(s) destination.
+
+    Blocks: non-http(s) schemes, RFC1918, loopback, link-local addresses.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(
+            f"policy_source URL must use http or https scheme, got {parsed.scheme!r}"
+        )
+    hostname = parsed.hostname
+    if not hostname:
+        raise ValueError(f"policy_source URL has no hostname: {url!r}")
+    try:
+        addr = ipaddress.ip_address(hostname)
+        for network in _PRIVATE_NETWORKS:
+            if addr in network:
+                raise ValueError(
+                    f"policy_source URL resolves to a private/internal address "
+                    f"({addr} is in {network}) — SSRF protection"
+                )
+    except ValueError as exc:
+        if "SSRF protection" in str(exc):
+            raise
+        # hostname is a domain name, not a bare IP — DNS resolution is not checked
+        # here (that would require async), but the scheme and IP-literal checks above
+        # catch the most common SSRF vectors (169.254.x.x, 127.x.x.x, etc.).
+        pass
+
+
+# ------------------------------------------------------------------
+# PolicyCache
+# ------------------------------------------------------------------
+
+_DEFAULT_CACHE_DIR = Path.home() / ".mcp-shield" / "cache"
+
+
+class PolicyCache:
+    """Persists a fetched policy to disk so ETag and policy survive process restarts.
+
+    Cache format (JSON):
+      {
+        "source_url": "https://...",
+        "fetched_at": "2026-04-27T12:00:00Z",
+        "etag": "\"v1\"",
+        "policy": { ... raw policy dict ... }
+      }
+    """
+
+    def __init__(self, cache_dir: Path | None = None) -> None:
+        self._path = (cache_dir or _DEFAULT_CACHE_DIR) / "policy.json"
+
+    def save(self, source_url: str, raw_dict: dict, etag: str | None) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "source_url": source_url,
+            "fetched_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "etag": etag,
+            "policy": raw_dict,
+        }
+        self._path.write_text(json.dumps(data, indent=2))
+        log.debug("Policy cached to %s", self._path)
+
+    def load(self) -> tuple[Policy, str | None] | None:
+        if not self._path.exists():
+            return None
+        try:
+            data = json.loads(self._path.read_text())
+            policy = load_policy_from_dict(data["policy"])
+            etag = data.get("etag")
+            log.debug("Loaded policy from cache (etag=%s, path=%s)", etag, self._path)
+            return policy, etag
+        except Exception as exc:
+            log.warning("Policy cache corrupt or unreadable (%s): %s", self._path, exc)
+            return None
 
 
 @runtime_checkable
@@ -69,11 +167,23 @@ class RemotePolicyProvider:
     - Raises RemotePolicyError on unrecoverable failure (4xx, exhausted retries)
     """
 
-    def __init__(self, url: str, api_key: str | None = None) -> None:
+    def __init__(
+        self,
+        url: str,
+        api_key: str | None = None,
+        cache: PolicyCache | None = None,
+    ) -> None:
+        _validate_policy_url(url)
         self.url = url
         self.api_key = api_key
         self._etag: str | None = None
         self._cached_policy: Policy | None = None
+        self._cache = cache
+        if cache is not None:
+            cached = cache.load()
+            if cached is not None:
+                self._cached_policy, self._etag = cached
+                log.debug("Pre-seeded policy from disk cache (etag=%s)", self._etag)
 
     async def fetch(self) -> Policy:
         headers: dict[str, str] = {}
@@ -94,7 +204,7 @@ class RemotePolicyProvider:
                 await asyncio.sleep(delay)
 
             try:
-                async with httpx.AsyncClient() as client:
+                async with httpx.AsyncClient(follow_redirects=False) as client:
                     resp = await client.get(
                         self.url, headers=headers, timeout=_REQUEST_TIMEOUT
                     )
@@ -113,7 +223,10 @@ class RemotePolicyProvider:
                 etag = resp.headers.get("ETag")
                 if etag:
                     self._etag = etag
-                self._cached_policy = load_policy_from_dict(resp.json())
+                raw = resp.json()
+                self._cached_policy = load_policy_from_dict(raw)
+                if self._cache is not None:
+                    self._cache.save(self.url, raw, etag)
                 log.info(
                     "Policy fetched from %s (etag=%s)",
                     self.url, etag or "none",
@@ -142,7 +255,10 @@ class RemotePolicyProvider:
 # Factory
 # ------------------------------------------------------------------
 
-def make_policy_provider(source: str) -> PolicyProvider:
+def make_policy_provider(
+    source: str,
+    cache: PolicyCache | None = None,
+) -> PolicyProvider:
     """Return the appropriate PolicyProvider for source.
 
     https?:// URL → RemotePolicyProvider (reads MCP_SHIELD_API_KEY from env).
@@ -152,5 +268,6 @@ def make_policy_provider(source: str) -> PolicyProvider:
         return RemotePolicyProvider(
             url=source,
             api_key=os.environ.get("MCP_SHIELD_API_KEY"),
+            cache=cache,
         )
     return FilePolicyProvider(path=source)

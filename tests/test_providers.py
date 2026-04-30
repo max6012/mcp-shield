@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import textwrap
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -11,9 +12,11 @@ import pytest
 
 from mcp_shield.providers import (
     FilePolicyProvider,
+    PolicyCache,
     PolicyProvider,
     RemotePolicyError,
     RemotePolicyProvider,
+    _validate_policy_url,
     make_policy_provider,
 )
 
@@ -434,6 +437,82 @@ class TestConfigProviderIntegration:
 
 
 # ------------------------------------------------------------------
+# URL validation / SSRF protection
+# ------------------------------------------------------------------
+
+class TestValidatePolicyUrl:
+
+    def test_valid_https_public_hostname_passes(self) -> None:
+        _validate_policy_url("https://policy.example.com/policy.json")
+
+    def test_valid_http_public_hostname_passes(self) -> None:
+        _validate_policy_url("http://policy.example.com/policy.json")
+
+    def test_file_scheme_raises(self) -> None:
+        with pytest.raises(ValueError, match="http or https scheme"):
+            _validate_policy_url("file:///etc/passwd")
+
+    def test_ftp_scheme_raises(self) -> None:
+        with pytest.raises(ValueError, match="http or https scheme"):
+            _validate_policy_url("ftp://files.example.com/policy.json")
+
+    def test_loopback_ipv4_raises(self) -> None:
+        with pytest.raises(ValueError, match="SSRF protection"):
+            _validate_policy_url("http://127.0.0.1/policy.json")
+
+    def test_loopback_ipv4_non_standard_raises(self) -> None:
+        with pytest.raises(ValueError, match="SSRF protection"):
+            _validate_policy_url("http://127.1.2.3/policy.json")
+
+    def test_link_local_aws_imds_raises(self) -> None:
+        with pytest.raises(ValueError, match="SSRF protection"):
+            _validate_policy_url("http://169.254.169.254/latest/meta-data/")
+
+    def test_rfc1918_10_raises(self) -> None:
+        with pytest.raises(ValueError, match="SSRF protection"):
+            _validate_policy_url("http://10.0.0.1/policy.json")
+
+    def test_rfc1918_172_raises(self) -> None:
+        with pytest.raises(ValueError, match="SSRF protection"):
+            _validate_policy_url("http://172.16.0.1/policy.json")
+
+    def test_rfc1918_192_raises(self) -> None:
+        with pytest.raises(ValueError, match="SSRF protection"):
+            _validate_policy_url("http://192.168.1.1/policy.json")
+
+    def test_ipv6_loopback_raises(self) -> None:
+        with pytest.raises(ValueError, match="SSRF protection"):
+            _validate_policy_url("http://[::1]/policy.json")
+
+    def test_public_ip_passes(self) -> None:
+        _validate_policy_url("http://203.0.113.1/policy.json")  # TEST-NET-3, public
+
+    def test_remote_provider_rejects_private_url_on_init(self) -> None:
+        with pytest.raises(ValueError, match="SSRF protection"):
+            RemotePolicyProvider("http://192.168.0.1/policy.json")
+
+    def test_make_policy_provider_rejects_private_url(self) -> None:
+        with pytest.raises(ValueError, match="SSRF protection"):
+            make_policy_provider("http://10.0.0.1/policy.json")
+
+    @pytest.mark.anyio
+    async def test_follow_redirects_false(self) -> None:
+        """httpx client must not follow redirects (could redirect to internal address)."""
+        with patch("mcp_shield.providers.httpx.AsyncClient") as mock_cls:
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=_mock_http_client(200, POLICY_DICT)[1])
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            mock_cls.return_value.get = AsyncMock(
+                return_value=MagicMock(status_code=200, headers={}, json=MagicMock(return_value=POLICY_DICT))
+            )
+            try:
+                await RemotePolicyProvider("https://example.com/p").fetch()
+            except Exception:
+                pass
+            _, kwargs = mock_cls.call_args
+            assert kwargs.get("follow_redirects") is False
+
+
+# ------------------------------------------------------------------
 # Protocol conformance
 # ------------------------------------------------------------------
 
@@ -444,3 +523,144 @@ class TestPolicyProviderProtocol:
 
     def test_remote_provider_satisfies_protocol(self) -> None:
         assert isinstance(RemotePolicyProvider("https://example.com/p"), PolicyProvider)
+
+
+# ------------------------------------------------------------------
+# PolicyCache
+# ------------------------------------------------------------------
+
+class TestPolicyCache:
+
+    def test_save_and_load_roundtrip(self, tmp_path: Path) -> None:
+        cache = PolicyCache(cache_dir=tmp_path)
+        cache.save("https://example.com/p", POLICY_DICT, etag='"v1"')
+        result = cache.load()
+        assert result is not None
+        policy, etag = result
+        assert etag == '"v1"'
+        assert policy.global_rule.action == "redact"
+        assert policy.server_rules["github"].action == "block"
+
+    def test_load_returns_none_when_file_missing(self, tmp_path: Path) -> None:
+        cache = PolicyCache(cache_dir=tmp_path / "nonexistent")
+        assert cache.load() is None
+
+    def test_load_returns_none_on_corrupt_json(self, tmp_path: Path) -> None:
+        cache = PolicyCache(cache_dir=tmp_path)
+        (tmp_path / "policy.json").write_text("not valid json {{{")
+        assert cache.load() is None
+
+    def test_load_returns_none_on_missing_policy_key(self, tmp_path: Path) -> None:
+        cache = PolicyCache(cache_dir=tmp_path)
+        (tmp_path / "policy.json").write_text('{"source_url": "x", "etag": null}')
+        assert cache.load() is None
+
+    def test_save_creates_parent_directories(self, tmp_path: Path) -> None:
+        cache = PolicyCache(cache_dir=tmp_path / "a" / "b" / "c")
+        cache.save("https://example.com/p", {"default_action": "log"}, etag=None)
+        assert (tmp_path / "a" / "b" / "c" / "policy.json").exists()
+
+    def test_save_includes_metadata(self, tmp_path: Path) -> None:
+        cache = PolicyCache(cache_dir=tmp_path)
+        cache.save("https://example.com/p", {"default_action": "log"}, etag='"v1"')
+        data = json.loads((tmp_path / "policy.json").read_text())
+        assert data["source_url"] == "https://example.com/p"
+        assert data["etag"] == '"v1"'
+        assert "fetched_at" in data
+        assert "policy" in data
+
+    def test_load_etag_none_when_not_stored(self, tmp_path: Path) -> None:
+        cache = PolicyCache(cache_dir=tmp_path)
+        cache.save("https://example.com/p", {"default_action": "log"}, etag=None)
+        result = cache.load()
+        assert result is not None
+        _, etag = result
+        assert etag is None
+
+    def test_second_save_overwrites_first(self, tmp_path: Path) -> None:
+        cache = PolicyCache(cache_dir=tmp_path)
+        cache.save("https://example.com/p", {"default_action": "log"}, etag='"v1"')
+        cache.save("https://example.com/p", {"default_action": "block"}, etag='"v2"')
+        result = cache.load()
+        assert result is not None
+        policy, etag = result
+        assert etag == '"v2"'
+        assert policy.global_rule.action == "block"
+
+
+# ------------------------------------------------------------------
+# RemotePolicyProvider — disk cache integration
+# ------------------------------------------------------------------
+
+class TestRemotePolicyProviderWithCache:
+
+    @pytest.mark.anyio
+    async def test_200_calls_cache_save(self, tmp_path: Path) -> None:
+        cache = PolicyCache(cache_dir=tmp_path)
+        patcher, _ = _mock_http_client(200, POLICY_DICT, etag='"v1"')
+        with patcher:
+            provider = RemotePolicyProvider("https://example.com/p", cache=cache)
+            await provider.fetch()
+
+        assert (tmp_path / "policy.json").exists()
+        data = json.loads((tmp_path / "policy.json").read_text())
+        assert data["etag"] == '"v1"'
+        assert data["policy"] == POLICY_DICT
+
+    @pytest.mark.anyio
+    async def test_init_pre_seeds_from_cache(self, tmp_path: Path) -> None:
+        cache = PolicyCache(cache_dir=tmp_path)
+        cache.save("https://example.com/p", POLICY_DICT, etag='"v1"')
+
+        provider = RemotePolicyProvider("https://example.com/p", cache=cache)
+        assert provider._etag == '"v1"'
+        assert provider._cached_policy is not None
+        assert provider._cached_policy.global_rule.action == "redact"
+
+    @pytest.mark.anyio
+    async def test_pre_seeded_etag_sent_on_first_request(self, tmp_path: Path) -> None:
+        cache = PolicyCache(cache_dir=tmp_path)
+        cache.save("https://example.com/p", POLICY_DICT, etag='"v1"')
+
+        patcher, mock_client = _mock_http_client(304)
+        with patcher:
+            provider = RemotePolicyProvider("https://example.com/p", cache=cache)
+            await provider.fetch()
+
+        _, kwargs = mock_client.get.call_args
+        assert kwargs["headers"]["If-None-Match"] == '"v1"'
+
+    @pytest.mark.anyio
+    async def test_304_with_pre_seeded_cache_returns_cached(self, tmp_path: Path) -> None:
+        cache = PolicyCache(cache_dir=tmp_path)
+        cache.save("https://example.com/p", POLICY_DICT, etag='"v1"')
+
+        patcher, _ = _mock_http_client(304)
+        with patcher:
+            provider = RemotePolicyProvider("https://example.com/p", cache=cache)
+            policy = await provider.fetch()
+
+        assert policy.global_rule.action == "redact"
+
+    @pytest.mark.anyio
+    async def test_no_cache_does_not_write_file(self, tmp_path: Path) -> None:
+        patcher, _ = _mock_http_client(200, POLICY_DICT, etag='"v1"')
+        with patcher:
+            provider = RemotePolicyProvider("https://example.com/p", cache=None)
+            await provider.fetch()
+
+        assert not (tmp_path / "policy.json").exists()
+
+    @pytest.mark.anyio
+    async def test_corrupt_cache_falls_through_to_fetch(self, tmp_path: Path) -> None:
+        cache = PolicyCache(cache_dir=tmp_path)
+        (tmp_path / "policy.json").write_text("garbage")
+
+        patcher, mock_client = _mock_http_client(200, POLICY_DICT, etag='"v2"')
+        with patcher:
+            provider = RemotePolicyProvider("https://example.com/p", cache=cache)
+            policy = await provider.fetch()
+
+        assert provider._etag is None or provider._etag == '"v2"'
+        assert mock_client.get.call_count == 1
+        assert policy.global_rule.action == "redact"

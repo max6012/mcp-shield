@@ -5,6 +5,7 @@ Records every tool call through the gateway to a SQLite database.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 import time
@@ -26,23 +27,9 @@ CREATE TABLE IF NOT EXISTS audit_log (
     timestamp   REAL    NOT NULL,
     server      TEXT    NOT NULL,
     tool        TEXT    NOT NULL,
-    direction   TEXT    NOT NULL,  -- 'request' or 'response'
-    action      TEXT    NOT NULL,  -- 'pass', 'log', 'redact', 'block'
-    matches     TEXT,              -- JSON array of match summaries
-    payload     TEXT,              -- full payload (if configured)
-    PRIMARY KEY (id)
-);
-"""
-
-# Fix: PRIMARY KEY already set via AUTOINCREMENT, remove duplicate
-_SCHEMA = """\
-CREATE TABLE IF NOT EXISTS audit_log (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp   REAL    NOT NULL,
-    server      TEXT    NOT NULL,
-    tool        TEXT    NOT NULL,
     direction   TEXT    NOT NULL,
     action      TEXT    NOT NULL,
+    max_severity TEXT,
     matches     TEXT,
     payload     TEXT
 );
@@ -50,7 +37,12 @@ CREATE TABLE IF NOT EXISTS audit_log (
 
 
 class AuditLog:
-    """SQLite-backed audit log."""
+    """SQLite-backed audit log.
+
+    Uses a per-write connection to avoid sharing state across concurrent
+    async callers. An asyncio.Lock serialises writes so concurrent proxy
+    calls don't race on the same file even in the same event loop.
+    """
 
     def __init__(
         self,
@@ -61,11 +53,19 @@ class AuditLog:
         self.db_path = db_path
         self.log_matched_text = log_matched_text
         self.log_full_payload = log_full_payload
-        self._conn = sqlite3.connect(db_path)
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.executescript(_SCHEMA)
+        self._lock = asyncio.Lock()
+        self._init_db()
 
-    def record(
+    def _init_db(self) -> None:
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.executescript(_SCHEMA)
+            conn.commit()
+        finally:
+            conn.close()
+
+    async def record(
         self,
         server: str,
         tool: str,
@@ -74,9 +74,12 @@ class AuditLog:
         matches: list[Match] | None = None,
         payload: Any = None,
     ) -> None:
-        """Write one audit record."""
+        """Write one audit record. Safe to call concurrently."""
         match_summaries = None
+        max_severity = None
         if matches:
+            _RANK = {"low": 1, "medium": 2, "high": 3, "critical": 4}
+            max_severity = max(matches, key=lambda m: _RANK.get(m.severity, 0)).severity
             match_summaries = json.dumps([
                 {
                     "pattern": m.pattern_name,
@@ -92,12 +95,39 @@ class AuditLog:
         if self.log_full_payload and payload is not None:
             payload_json = json.dumps(payload, default=str)
 
-        self._conn.execute(
-            "INSERT INTO audit_log (timestamp, server, tool, direction, action, matches, payload) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (time.time(), server, tool, direction, action, match_summaries, payload_json),
-        )
-        self._conn.commit()
+        loop = asyncio.get_event_loop()
+        async with self._lock:
+            await loop.run_in_executor(
+                None,
+                self._write,
+                time.time(), server, tool, direction, action,
+                max_severity, match_summaries, payload_json,
+            )
+
+    def _write(
+        self,
+        timestamp: float,
+        server: str,
+        tool: str,
+        direction: str,
+        action: str,
+        max_severity: str | None,
+        match_summaries: str | None,
+        payload_json: str | None,
+    ) -> None:
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute(
+                "INSERT INTO audit_log "
+                "(timestamp, server, tool, direction, action, max_severity, matches, payload) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (timestamp, server, tool, direction, action,
+                 max_severity, match_summaries, payload_json),
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
     def query(
         self,
@@ -106,7 +136,8 @@ class AuditLog:
         tool: str | None = None,
     ) -> list[dict]:
         """Query audit records."""
-        sql = "SELECT id, timestamp, server, tool, direction, action, matches, payload FROM audit_log"
+        sql = ("SELECT id, timestamp, server, tool, direction, action, "
+               "max_severity, matches, payload FROM audit_log")
         conditions = []
         params: list[Any] = []
 
@@ -115,9 +146,8 @@ class AuditLog:
             params.append(tool)
 
         if severity:
-            # Filter by severity in the JSON matches field
-            conditions.append("matches LIKE ?")
-            params.append(f'%"severity": "{severity}"%')
+            conditions.append("max_severity = ?")
+            params.append(severity)
 
         if conditions:
             sql += " WHERE " + " AND ".join(conditions)
@@ -125,7 +155,12 @@ class AuditLog:
         sql += " ORDER BY id DESC LIMIT ?"
         params.append(last)
 
-        rows = self._conn.execute(sql, params).fetchall()
+        conn = sqlite3.connect(self.db_path)
+        try:
+            rows = conn.execute(sql, params).fetchall()
+        finally:
+            conn.close()
+
         return [
             {
                 "id": r[0],
@@ -134,14 +169,15 @@ class AuditLog:
                 "tool": r[3],
                 "direction": r[4],
                 "action": r[5],
-                "matches": json.loads(r[6]) if r[6] else None,
-                "payload": json.loads(r[7]) if r[7] else None,
+                "max_severity": r[6],
+                "matches": json.loads(r[7]) if r[7] else None,
+                "payload": json.loads(r[8]) if r[8] else None,
             }
             for r in rows
         ]
 
     def close(self) -> None:
-        self._conn.close()
+        pass  # connections are closed after each write; nothing to do here
 
 
 # ------------------------------------------------------------------
@@ -161,7 +197,6 @@ def query_audit_log(
 
     audit = AuditLog(db_path=db_path)
     rows = audit.query(last=last, severity=severity, tool=tool)
-    audit.close()
 
     if not rows:
         print("No matching records.")
@@ -173,5 +208,6 @@ def query_audit_log(
         if row["matches"]:
             patterns = [m["pattern"] for m in row["matches"]]
             matches_str = f" matches=[{', '.join(patterns)}]"
+        sev_str = f" max_severity={row['max_severity']}" if row["max_severity"] else ""
         print(f"[{ts}] {row['direction']:8s} {row['server']}.{row['tool']} "
-              f"action={row['action']}{matches_str}")
+              f"action={row['action']}{sev_str}{matches_str}")

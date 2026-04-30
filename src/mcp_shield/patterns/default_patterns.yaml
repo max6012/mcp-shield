@@ -18,10 +18,11 @@
 
 - name: aws_secret_access_key
   description: >
-    AWS Secret Access Key. Matches a 40-character base64 string that follows
-    an assignment pattern (=, :, or quotes) to reduce false positives.
-    Example: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
-  regex: '(?<=[=:"''])\s*[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])'
+    AWS Secret Access Key. Requires an aws_secret_access_key or
+    aws_secret key context (case-insensitive) within 40 characters before
+    the value to avoid firing on arbitrary 40-char base64 strings.
+    Example: aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+  regex: '(?i)aws.{0,20}secret.{0,20}(?:key|token).{0,10}[=:''"\s]\s*[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])'
   severity: critical
   category: credentials
 
@@ -99,10 +100,47 @@
 
 - name: bearer_token
   description: >
-    Bearer token in HTTP Authorization header. Matches Bearer followed by a
-    token of 20+ characters (alphanumeric, hyphens, underscores, dots, tildes).
+    Bearer token in an HTTP Authorization header or similar context.
+    Requires an Authorization: or authorization: prefix to avoid firing on
+    arbitrary "Bearer" occurrences in prose or documentation.
     Example: Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9
-  regex: 'Bearer\s+[A-Za-z0-9\-._~+/]{20,}=*'
+  regex: '(?i)authorization:\s*Bearer\s+[A-Za-z0-9\-._~+/]{20,}=*'
+  severity: critical
+  category: credentials
+
+- name: openai_api_key
+  description: >
+    OpenAI API key. Matches the sk- prefix followed by an optional project key
+    segment (sk-proj-), then 40+ alphanumeric/hyphen/underscore chars.
+    Example: sk-proj-abc123...
+  regex: 'sk-(?:proj-)?[A-Za-z0-9\-_]{40,}'
+  severity: critical
+  category: credentials
+
+- name: anthropic_api_key
+  description: >
+    Anthropic API key. Matches the sk-ant- prefix followed by the key body.
+    Example: sk-ant-api03-abc123...
+  regex: 'sk-ant-[A-Za-z0-9\-_]{32,}'
+  severity: critical
+  category: credentials
+
+- name: twilio_auth_token
+  description: >
+    Twilio Account SID or Auth Token. Account SIDs start with AC followed by
+    32 hex chars; auth tokens are 32 lowercase hex chars following a context
+    keyword.
+    Example: ACabc1234567890abcdef1234567890ab
+  regex: 'AC[0-9a-f]{32}'
+  severity: critical
+  category: credentials
+
+- name: npm_token
+  description: >
+    NPM publish or automation token. Matches npm_ followed by 36 alphanumeric
+    characters.
+    Example: npm_abc123ABC456...
+  regex: 'npm_[A-Za-z0-9]{36}'
   severity: critical
   category: credentials
 
@@ -195,11 +233,11 @@
 - name: us_phone_number
   description: >
     US phone number in common formats. Matches (xxx) xxx-xxxx, xxx-xxx-xxxx,
-    and +1xxxxxxxxxx variants. Requires a leading boundary to reduce false
-    positives.
+    and +1xxxxxxxxxx variants. Severity is medium because this pattern has
+    higher false-positive risk in technical docs containing numeric sequences.
     Example: (555) 123-4567 or +15551234567
   regex: '(?<!\d)(?:\+1[\s\-]?)?(?:\(\d{3}\)[\s\-]?|\d{3}[\s\-])\d{3}[\s\-]?\d{4}(?!\d)'
-  severity: high
+  severity: medium
   category: pii
 
 # =============================================================================
@@ -219,9 +257,11 @@
 - name: generic_connection_string_with_password
   description: >
     Generic connection string with embedded credentials in the
-    user:password@host pattern. Matches any scheme.
+    scheme://user:password@host pattern. Requires a :// scheme prefix to
+    avoid matching SSH-style git@github.com:org/repo URIs. The password
+    segment must not be empty or a lone wildcard.
     Example: amqp://admin:s3cret@rabbitmq.internal:5672/vhost
-  regex: '\w+://[^:/@\s]+:[^:/@\s]+@[^/\s]+'
+  regex: '[a-zA-Z][a-zA-Z0-9+\-.]+://[^:/@\s]{1,64}:[^:/@\s]{2,}@[^/\s]+'
   severity: high
   category: infrastructure
 

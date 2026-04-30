@@ -1,6 +1,10 @@
 # MCP Shield
 
-A security gateway for Model Context Protocol (MCP) servers. MCP Shield sits between AI clients (Claude Desktop, Claude Code, Cursor, etc.) and the MCP servers they use, proxying tool calls and responses while inspecting traffic for sensitive data — secrets, credentials, PII — via regex pattern matching. No LLM inference in the inspection path.
+A regex-based DLP proxy for the MCP stdio transport. MCP Shield sits between an AI client (Claude Desktop, Claude Code, Cursor, etc.) and its MCP servers, intercepting tool calls and responses to scan for known credential formats and PII. Matches are blocked, redacted, or logged according to a policy you control.
+
+**What this is:** a transport-layer DLP filter. It catches secrets and PII that appear in tool arguments or tool responses — known formats that your patterns cover.
+
+**What this is not:** a defense against prompt injection, malicious MCP servers, or credential formats you haven't written patterns for. See [Threat model](#threat-model) for the full scope.
 
 ## Current state
 
@@ -32,6 +36,7 @@ Working MVP. Handles stdio-transport MCP servers end-to-end.
 - **A malicious downstream MCP server.** MCP Shield trusts the servers listed in its config. If a downstream server is itself compromised or adversarial, MCP Shield will proxy its calls faithfully, subject only to pattern matches on the traffic content.
 - **Policy endpoint compromise.** If the remote policy source is tampered with, an attacker can silently weaken enforcement (e.g., flip all rules to `log`). Cryptographic signing of policy responses is in the backlog; until then, treat the policy endpoint as a high-value target.
 - **Credentials that never appear in tool call text.** Secrets injected at the OS or container level, or passed through side channels outside the MCP protocol, are invisible to the gateway.
+- **Non-text MCP content.** `ImageContent` blobs (screenshots, rendered pages) are passed through unscanned — regex cannot read pixels. `EmbeddedResource` text blobs are scanned; binary resources are not.
 
 ### Trust boundaries
 

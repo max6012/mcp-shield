@@ -142,16 +142,23 @@ class GatewayConfig:
 # ------------------------------------------------------------------
 
 def _parse_policy_rule(raw: dict[str, Any]) -> PolicyRule:
+    # custom_patterns_file is intentionally excluded here — it references a local
+    # filesystem path and must only be set via load_config (which reads the trusted
+    # local config file). Allowing it through load_policy_from_dict would let a
+    # remote policy endpoint trigger an arbitrary file read.
     return PolicyRule(
         action=raw.get("default_action", "log"),
         severity_threshold=raw.get("severity_threshold", "low"),
         enabled_categories=raw.get("enabled_categories"),
-        custom_patterns_file=raw.get("custom_patterns_file"),
     )
 
 
 def load_policy_from_dict(raw: dict[str, Any]) -> Policy:
-    """Build a Policy from a raw dict (YAML section or remote fetch response)."""
+    """Build a Policy from a raw dict (YAML section or remote fetch response).
+
+    Note: custom_patterns_file is stripped from all rules here. Only load_config
+    (which reads a trusted local file) may set it.
+    """
     return Policy(
         global_rule=_parse_policy_rule(raw),
         server_rules={
@@ -193,4 +200,21 @@ def load_config(path: str | Path) -> GatewayConfig:
     if not isinstance(policy_raw, dict):
         raise ValueError("'policy' section must be a mapping")
 
-    return GatewayConfig(local=local, policy=load_policy_from_dict(policy_raw))
+    policy = load_policy_from_dict(policy_raw)
+
+    # custom_patterns_file is a local filesystem path — only honour it when reading
+    # from the trusted local config file, never from a remote policy fetch.
+    custom_patterns_file = policy_raw.get("custom_patterns_file")
+    if custom_patterns_file:
+        policy = Policy(
+            global_rule=PolicyRule(
+                action=policy.global_rule.action,
+                severity_threshold=policy.global_rule.severity_threshold,
+                enabled_categories=policy.global_rule.enabled_categories,
+                custom_patterns_file=custom_patterns_file,
+            ),
+            server_rules=policy.server_rules,
+            tool_rules=policy.tool_rules,
+        )
+
+    return GatewayConfig(local=local, policy=policy)
