@@ -31,6 +31,7 @@ class PolicyAction(enum.Enum):
 _VALID_ACTIONS = {a.value for a in PolicyAction}
 _SEVERITY_LEVELS = ("low", "medium", "high", "critical")
 _SEVERITY_RANK = {level: idx for idx, level in enumerate(_SEVERITY_LEVELS)}
+_VALID_FALLBACK_MODES = ("fail-open", "fail-closed")
 
 
 def _validate_action(value: str) -> str:
@@ -96,6 +97,13 @@ class Policy:
         return self.global_rule
 
 
+# Safe default used when remote policy is unreachable and no cache exists.
+# Detects and logs everything; never blocks or redacts — operator must fix the endpoint.
+FALLBACK_POLICY = Policy(
+    global_rule=PolicyRule(action="log", severity_threshold="low"),
+)
+
+
 # ------------------------------------------------------------------
 # LocalConfig — bootstrap config, lives on disk, user-editable
 # ------------------------------------------------------------------
@@ -112,6 +120,9 @@ class LocalConfig:
         "log_full_payload": False,
     })
     policy_source: str | None = None  # URL or path; None = use inline policy from YAML
+    fallback_mode: str = "fail-open"  # "fail-open" | "fail-closed"
+    policy_refresh_seconds: int = 14400  # 0 = disable polling; default 4 h
+    discovery_source: str | None = None  # path to Claude-format mcpServers JSON
 
 
 # ------------------------------------------------------------------
@@ -185,6 +196,12 @@ def load_config(path: str | Path) -> GatewayConfig:
     if "downstream_servers" not in raw:
         raise ValueError("Config must contain a 'downstream_servers' section")
 
+    fallback_mode = raw.get("fallback_mode", "fail-open")
+    if fallback_mode not in _VALID_FALLBACK_MODES:
+        raise ValueError(
+            f"Invalid fallback_mode {fallback_mode!r}; must be one of {list(_VALID_FALLBACK_MODES)}"
+        )
+
     audit_raw = raw.get("audit", {})
     local = LocalConfig(
         downstream_servers=raw["downstream_servers"],
@@ -194,6 +211,9 @@ def load_config(path: str | Path) -> GatewayConfig:
             "log_full_payload": audit_raw.get("log_full_payload", False),
         },
         policy_source=raw.get("policy_source"),
+        fallback_mode=fallback_mode,
+        policy_refresh_seconds=int(raw.get("policy_refresh_seconds", 14400)),
+        discovery_source=raw.get("discovery_source"),
     )
 
     policy_raw = raw.get("policy", {})

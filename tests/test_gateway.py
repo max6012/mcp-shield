@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import tempfile
 from contextlib import AsyncExitStack
@@ -13,7 +14,7 @@ import pytest
 from mcp.types import CallToolResult, EmbeddedResource, TextContent, TextResourceContents, Tool
 
 from mcp_shield.gateway import DownstreamServer, ShieldGateway, _resolve_patterns_path, create_server
-from mcp_shield.policy import GatewayConfig, LocalConfig, Policy, PolicyRule
+from mcp_shield.policy import FALLBACK_POLICY, GatewayConfig, LocalConfig, Policy, PolicyRule
 from mcp_shield.scanner import Scanner
 
 
@@ -632,3 +633,248 @@ class TestEmbeddedResourceScanning:
 
         result = await gw.proxy_call("testserver__echo", {"query": "screenshot"})
         assert result.isError is False
+
+
+# ------------------------------------------------------------------
+# Periodic policy refresh
+# ------------------------------------------------------------------
+
+class TestPolicyRefresh:
+
+    async def _run_refresh_until(self, gw, done_event: asyncio.Event) -> None:
+        """Run the refresh loop (interval=0) until done_event is set, then cancel."""
+        task = asyncio.create_task(gw._refresh_loop(interval=0))
+        await asyncio.wait_for(done_event.wait(), timeout=1.0)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    @pytest.mark.anyio
+    async def test_refresh_picks_up_changed_policy(self, scanner) -> None:
+        """Refresh loop updates gateway.config when provider returns a new policy."""
+        from mcp_shield.policy import Policy, PolicyRule
+
+        config = _make_config(global_policy=PolicyRule(action="log"))
+        gw = _make_gateway_with_fake_downstream(config, scanner=scanner)
+
+        new_policy = Policy(global_rule=PolicyRule(action="block"))
+        fetched = asyncio.Event()
+
+        async def fake_fetch():
+            fetched.set()
+            return new_policy
+
+        gw._provider = MagicMock()
+        gw._provider.fetch = fake_fetch
+
+        await self._run_refresh_until(gw, fetched)
+        assert gw.config.policy.global_rule.action == "block"
+
+    @pytest.mark.anyio
+    async def test_refresh_failure_keeps_current_policy(self, scanner) -> None:
+        """Refresh loop keeps current policy when fetch fails."""
+        config = _make_config(global_policy=PolicyRule(action="log"))
+        gw = _make_gateway_with_fake_downstream(config, scanner=scanner)
+
+        attempted = asyncio.Event()
+
+        async def failing_fetch():
+            attempted.set()
+            raise Exception("timeout")
+
+        gw._provider = MagicMock()
+        gw._provider.fetch = failing_fetch
+
+        await self._run_refresh_until(gw, attempted)
+        assert gw.config.policy.global_rule.action == "log"
+
+    @pytest.mark.anyio
+    async def test_refresh_clears_fallback_flag(self, scanner) -> None:
+        """A successful refresh clears is_fallback even if gateway started in fallback mode."""
+        from mcp_shield.policy import Policy, PolicyRule
+
+        config = _make_config(global_policy=PolicyRule(action="log"))
+        gw = _make_gateway_with_fake_downstream(config, scanner=scanner)
+        gw.is_fallback = True
+
+        new_policy = Policy(global_rule=PolicyRule(action="log"))
+        fetched = asyncio.Event()
+
+        async def fake_fetch():
+            fetched.set()
+            return new_policy
+
+        gw._provider = MagicMock()
+        gw._provider.fetch = fake_fetch
+
+        await self._run_refresh_until(gw, fetched)
+        assert gw.is_fallback is False
+
+    @pytest.mark.anyio
+    async def test_refresh_zero_interval_disables_polling(self, scanner) -> None:
+        """policy_refresh_seconds=0 means no refresh task is created."""
+        from mcp_shield.policy import LocalConfig, GatewayConfig, Policy, PolicyRule
+
+        local = LocalConfig(downstream_servers={}, policy_refresh_seconds=0)
+        config = GatewayConfig(local=local, policy=Policy(global_rule=PolicyRule(action="log")))
+        gw = ShieldGateway(config, scanner=scanner)
+        assert gw._refresh_task is None
+
+        # After start() with no downstream servers, no refresh task either
+        await gw.start()
+        assert gw._refresh_task is None
+        await gw.shutdown()
+
+    def test_policy_refresh_seconds_default(self) -> None:
+        from mcp_shield.policy import LocalConfig
+        local = LocalConfig(downstream_servers={})
+        assert local.policy_refresh_seconds == 14400
+
+    def test_policy_refresh_seconds_parsed_from_config(self, tmp_path) -> None:
+        import textwrap
+        from mcp_shield.policy import load_config
+        p = tmp_path / "config.yaml"
+        p.write_text(textwrap.dedent("""\
+            downstream_servers:
+              s1:
+                command: echo
+            policy_refresh_seconds: 3600
+            policy:
+              default_action: log
+        """))
+        cfg = load_config(p)
+        assert cfg.local.policy_refresh_seconds == 3600
+
+
+# ------------------------------------------------------------------
+# Fail-open / fail-closed fallback
+# ------------------------------------------------------------------
+
+class TestFallbackPolicy:
+
+    @pytest.mark.anyio
+    async def test_fail_open_allows_tool_calls(self, scanner) -> None:
+        """fail-open fallback: tool calls proceed, result returned."""
+        config = _make_config()
+        gw = _make_gateway_with_fake_downstream(config, scanner=scanner)
+        gw.is_fallback = True
+        # fallback_mode defaults to "fail-open" in LocalConfig
+        result = await gw.proxy_call("testserver__echo", {"msg": "hello"})
+        assert result.isError is False
+
+    @pytest.mark.anyio
+    async def test_fail_open_logs_warning_per_call(self, scanner, caplog) -> None:
+        """fail-open fallback: a warning is logged for every proxied call."""
+        import logging
+        config = _make_config()
+        gw = _make_gateway_with_fake_downstream(config, scanner=scanner)
+        gw.is_fallback = True
+
+        with caplog.at_level(logging.WARNING, logger="mcp-shield"):
+            await gw.proxy_call("testserver__echo", {"msg": "hello"})
+
+        assert any("FALLBACK" in r.message for r in caplog.records)
+
+    @pytest.mark.anyio
+    async def test_fail_closed_refuses_all_tool_calls(self, scanner) -> None:
+        """fail-closed fallback: every tool call returns an error immediately."""
+        from mcp_shield.policy import FALLBACK_POLICY
+        local = LocalConfig(downstream_servers={}, fallback_mode="fail-closed")
+        config = GatewayConfig(local=local, policy=FALLBACK_POLICY)
+        gw = _make_gateway_with_fake_downstream(config, scanner=scanner)
+        gw.is_fallback = True
+
+        result = await gw.proxy_call("testserver__echo", {"msg": "hello"})
+        assert result.isError is True
+        assert "fail-closed" in result.content[0].text
+
+    @pytest.mark.anyio
+    async def test_fail_closed_does_not_call_downstream(self, scanner) -> None:
+        """fail-closed: downstream session.call_tool is never invoked."""
+        from mcp_shield.policy import FALLBACK_POLICY
+        local = LocalConfig(downstream_servers={}, fallback_mode="fail-closed")
+        config = GatewayConfig(local=local, policy=FALLBACK_POLICY)
+        gw = _make_gateway_with_fake_downstream(config, scanner=scanner)
+        gw.is_fallback = True
+
+        await gw.proxy_call("testserver__echo", {})
+        gw.downstream["testserver"].session.call_tool.assert_not_called()
+
+    @pytest.mark.anyio
+    async def test_is_fallback_false_by_default(self, scanner) -> None:
+        """Normal gateway (no fetch failure) has is_fallback=False."""
+        config = _make_config()
+        gw = ShieldGateway(config, scanner=scanner)
+        assert gw.is_fallback is False
+
+    def test_run_gateway_fail_closed_raises_on_fetch_failure(self, tmp_path) -> None:
+        """run_gateway with fail-closed refuses to start if policy fetch fails."""
+        import textwrap
+        from unittest.mock import patch
+        from mcp_shield.gateway import run_gateway
+
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(textwrap.dedent("""\
+            downstream_servers: {}
+            policy_source: https://unreachable.example.com/policy.json
+            fallback_mode: fail-closed
+            policy:
+              default_action: log
+        """))
+
+        # Patch asyncio.run: first call is the policy fetch (make it fail)
+        original_asyncio_run = __import__("asyncio").run
+        call_count = [0]
+        def patched_run(coro):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise Exception("simulated fetch failure")
+            return original_asyncio_run(coro)
+
+        with patch("mcp_shield.gateway.asyncio.run", side_effect=patched_run):
+            with pytest.raises(RuntimeError, match="fail-closed"):
+                run_gateway(str(config_file))
+
+    def test_run_gateway_fail_open_starts_with_fallback_policy(self, tmp_path) -> None:
+        """run_gateway with fail-open uses FALLBACK_POLICY when fetch fails."""
+        import textwrap
+        from unittest.mock import patch
+        from mcp_shield.gateway import run_gateway
+        from mcp_shield.policy import FALLBACK_POLICY
+
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(textwrap.dedent("""\
+            downstream_servers: {}
+            policy_source: https://unreachable.example.com/policy.json
+            fallback_mode: fail-open
+            policy:
+              default_action: block
+        """))
+
+        gateways_created = []
+
+        class CapturingGateway(ShieldGateway):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                gateways_created.append(self)
+
+        call_count = [0]
+        def patched_run(coro):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise Exception("simulated fetch failure")
+            # Second call is main() — stop before it runs
+            raise SystemExit(0)
+
+        with patch("mcp_shield.gateway.asyncio.run", side_effect=patched_run), \
+             patch("mcp_shield.gateway.ShieldGateway", CapturingGateway):
+            try:
+                run_gateway(str(config_file))
+            except SystemExit:
+                pass
+
+        assert len(gateways_created) == 1
+        assert gateways_created[0].is_fallback is True
+        assert gateways_created[0].config.policy.global_rule.action == "log"

@@ -8,16 +8,21 @@ A regex-based DLP proxy for the MCP stdio transport. MCP Shield sits between an 
 
 ## Current state
 
-Working MVP. Handles stdio-transport MCP servers end-to-end.
+v0.2. Handles stdio-transport MCP servers end-to-end with centralized policy management.
 
 - Proxy gateway aggregates and namespaces tools from multiple downstream MCP servers
-- 24 built-in patterns across 5 categories: cloud credentials, API tokens, cryptographic material, structured PII, infrastructure
+- 28 built-in patterns across 5 categories: cloud credentials, API tokens, cryptographic material, structured PII, infrastructure
 - Policy engine with three-level inheritance (tool > server > global), severity thresholds, category filters
 - `block` / `redact` / `log` actions applied to both requests and responses
 - SQLite audit log with configurable payload and plaintext capture
 - `PolicyProvider` abstraction separates local bootstrap config from security policy — policy is independently loadable from a local file or a remote HTTPS endpoint
-- Remote policy fetch with X-API-Key auth, ETag caching, and retry/backoff
-- 86 tests passing
+- Remote policy fetch with X-API-Key auth, ETag caching, retry/backoff, and disk-persisted ETag cache
+- Configurable fail-open / fail-closed fallback when policy endpoint is unreachable
+- Periodic background policy refresh (4 hour default, configurable)
+- Auto-discovery of downstream servers from Claude Desktop / Claude Code `mcpServers` JSON format
+- 203 tests passing
+
+For IT/enterprise deployment, SSRF protections, MDM integration, and policy server setup, see [DEPLOYMENT.md](DEPLOYMENT.md).
 
 ## Threat model
 
@@ -44,14 +49,14 @@ MCP Shield trusts its own process and config. Everything in tool call traffic �
 
 ## Roadmap
 
-### v0.2 — Centralized policy and deployment
+### v0.2 — Centralized policy and deployment ✓
 
 - ~~Separate local bootstrap config from centrally-managed policy~~ ✓
 - ~~Remote policy fetch over HTTPS with API-key auth, ETag support, retry/backoff~~ ✓
-- Local policy cache (survives process restarts), configurable fail-open / fail-closed fallback
-- Periodic background refresh (4 hour default)
-- Auto-discovery of downstream MCP servers from the universal `mcpServers` config schema
-- Deployment guide covering MDM integration and the threat model boundaries
+- ~~Local policy cache (survives process restarts), configurable fail-open / fail-closed fallback~~ ✓
+- ~~Periodic background refresh (4 hour default)~~ ✓
+- ~~Auto-discovery of downstream MCP servers from the universal `mcpServers` config schema~~ ✓
+- ~~Deployment guide covering MDM integration and the threat model boundaries~~ ✓
 
 ### Backlog
 

@@ -21,7 +21,7 @@ from mcp.server.stdio import stdio_server
 from mcp.types import CallToolResult, EmbeddedResource, TextContent, TextResourceContents, Tool
 
 from mcp_shield.audit import AuditLog
-from mcp_shield.policy import GatewayConfig, PolicyRule, _SEVERITY_RANK, load_config
+from mcp_shield.policy import FALLBACK_POLICY, GatewayConfig, PolicyRule, _SEVERITY_RANK, load_config
 from mcp_shield.scanner import Match, Scanner
 
 log = logging.getLogger("mcp-shield")
@@ -69,14 +69,19 @@ class ShieldGateway:
         config: GatewayConfig,
         scanner: Scanner | None = None,
         audit: AuditLog | None = None,
+        is_fallback: bool = False,
+        provider=None,
     ):
         self.config = config
         self.scanner = scanner
         self.audit = audit
+        self.is_fallback = is_fallback
+        self._provider = provider  # PolicyProvider | None — used by refresh loop
         self.downstream: dict[str, DownstreamServer] = {}
         self._stack = AsyncExitStack()
         # Maps namespaced tool name → (server_name, original_tool_name)
         self._tool_map: dict[str, tuple[str, str]] = {}
+        self._refresh_task: asyncio.Task | None = None
 
     async def start(self) -> None:
         """Connect to all downstream servers and build the tool map."""
@@ -128,6 +133,21 @@ class ShieldGateway:
         self, namespaced_name: str, arguments: dict[str, Any]
     ) -> CallToolResult:
         """Forward a tool call to the correct downstream server, with scanning."""
+        if self.is_fallback and self.config.local.fallback_mode == "fail-closed":
+            return CallToolResult(
+                content=[TextContent(
+                    type="text",
+                    text="MCP Shield: no valid policy (endpoint unreachable, no cache, fail-closed configured)",
+                )],
+                isError=True,
+            )
+
+        if self.is_fallback:
+            log.warning(
+                "MCP SHIELD FALLBACK: processing %s without enforced policy (fail-open)",
+                namespaced_name,
+            )
+
         if namespaced_name not in self._tool_map:
             return CallToolResult(
                 content=[TextContent(type="text", text=f"Unknown tool: {namespaced_name}")],
@@ -275,7 +295,38 @@ class ShieldGateway:
                 new_content.append(content)
         return CallToolResult(content=new_content, isError=result.isError)
 
+    async def _refresh_loop(self, interval: int) -> None:
+        """Background task: re-fetch policy every interval seconds."""
+        while True:
+            await asyncio.sleep(interval)
+            if self._provider is None:
+                return
+            try:
+                new_policy = await self._provider.fetch()
+            except Exception as exc:
+                log.warning("Policy refresh failed (keeping current policy): %s", exc)
+                continue
+
+            old_action = self.config.policy.global_rule.action
+            new_action = new_policy.global_rule.action
+            if new_action != old_action:
+                log.info(
+                    "Policy refreshed: global action %s → %s",
+                    old_action, new_action,
+                )
+            else:
+                log.debug("Policy refreshed (no change to global action: %s)", old_action)
+
+            self.config = GatewayConfig(local=self.config.local, policy=new_policy)
+            self.is_fallback = False  # successful fetch clears fallback flag
+
     async def shutdown(self) -> None:
+        if self._refresh_task is not None:
+            self._refresh_task.cancel()
+            try:
+                await self._refresh_task
+            except asyncio.CancelledError:
+                pass
         await self._stack.aclose()
 
 
@@ -329,6 +380,22 @@ def create_server(gateway: ShieldGateway) -> Server:
     @asynccontextmanager
     async def lifespan(server: Server):
         await gateway.start()
+        if gateway.is_fallback:
+            log.warning(
+                "MCP SHIELD: operating without enforced policy (fail-open fallback). "
+                "Scanner still detects and logs, but nothing is blocked or redacted. "
+                "Fix the policy endpoint or provide a local cache."
+            )
+            if gateway.audit:
+                await gateway.audit.record("*", "*", "startup", "fallback")
+
+        refresh_secs = gateway.config.local.policy_refresh_seconds
+        if gateway._provider is not None and refresh_secs > 0:
+            gateway._refresh_task = asyncio.create_task(
+                gateway._refresh_loop(refresh_secs)
+            )
+            log.info("Policy refresh scheduled every %ds", refresh_secs)
+
         try:
             yield {}
         finally:
@@ -370,8 +437,10 @@ def run_gateway(config_path: str) -> None:
 
     # If a policy_source is configured, fetch the live policy and replace the
     # inline bootstrap policy from the config file.
+    is_fallback = False
+    provider = None
     if config.local.policy_source:
-        from mcp_shield.providers import PolicyCache, make_policy_provider
+        from mcp_shield.providers import PolicyCache, RemotePolicyError, make_policy_provider
 
         provider = make_policy_provider(
             config.local.policy_source,
@@ -382,9 +451,61 @@ def run_gateway(config_path: str) -> None:
         async def _fetch_policy():
             return await provider.fetch()
 
-        live_policy = asyncio.run(_fetch_policy())
-        config = GatewayConfig(local=config.local, policy=live_policy)
-        log.info("Live policy loaded (global action: %s)", live_policy.global_rule.action)
+        try:
+            live_policy = asyncio.run(_fetch_policy())
+            config = GatewayConfig(local=config.local, policy=live_policy)
+            log.info("Live policy loaded (global action: %s)", live_policy.global_rule.action)
+        except Exception as exc:
+            if config.local.fallback_mode == "fail-closed":
+                raise RuntimeError(
+                    f"MCP Shield: policy fetch failed and fallback_mode=fail-closed — refusing to start. "
+                    f"Error: {exc}"
+                ) from exc
+            log.warning(
+                "MCP SHIELD: policy fetch failed (%s). "
+                "Falling back to fail-open default (log-only). "
+                "Fix the policy endpoint or provide a local cache.",
+                exc,
+            )
+            config = GatewayConfig(local=config.local, policy=FALLBACK_POLICY)
+            is_fallback = True
+
+    # Build the final server inventory: discovered servers + explicit servers.
+    # Explicit entries (from config file) win on name conflict.
+    if config.local.discovery_source:
+        from mcp_shield.discovery import DiscoveryLoader
+
+        discovered: dict = {}
+        for name, srv_config in DiscoveryLoader(config.local.discovery_source).load():
+            discovered[name] = srv_config
+
+        merged = {**discovered, **config.local.downstream_servers}
+        if not merged:
+            log.warning(
+                "MCP Shield has no downstream servers to proxy (discovery source empty "
+                "and no explicit servers configured); it will appear as an empty MCP server."
+            )
+        elif discovered:
+            log.info(
+                "Server inventory: %d discovered + %d explicit = %d total",
+                len(discovered), len(config.local.downstream_servers), len(merged),
+            )
+        from mcp_shield.policy import GatewayConfig as _GC, LocalConfig as _LC
+        merged_local = _LC(
+            downstream_servers=merged,
+            audit=config.local.audit,
+            policy_source=config.local.policy_source,
+            fallback_mode=config.local.fallback_mode,
+            policy_refresh_seconds=config.local.policy_refresh_seconds,
+            discovery_source=config.local.discovery_source,
+        )
+        config = _GC(local=merged_local, policy=config.policy)
+
+    elif not config.local.downstream_servers:
+        log.warning(
+            "MCP Shield has no downstream servers to proxy; "
+            "it will appear as an empty MCP server to clients."
+        )
 
     patterns_path = _resolve_patterns_path(config)
     scanner = Scanner(patterns_path)
@@ -397,7 +518,7 @@ def run_gateway(config_path: str) -> None:
     )
     log.info("Audit log: %s", audit.db_path)
 
-    gateway = ShieldGateway(config, scanner=scanner, audit=audit)
+    gateway = ShieldGateway(config, scanner=scanner, audit=audit, is_fallback=is_fallback, provider=provider)
     server = create_server(gateway)
 
     async def main():

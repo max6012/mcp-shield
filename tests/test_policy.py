@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from mcp_shield.policy import (
+    FALLBACK_POLICY,
     GatewayConfig,
     LocalConfig,
     Policy,
@@ -157,6 +158,50 @@ class TestLoadConfig:
     def test_policy_source_defaults_to_none(self, config_file: Path) -> None:
         cfg = load_config(config_file)
         assert cfg.local.policy_source is None
+
+    def test_fallback_mode_defaults_to_fail_open(self, config_file: Path) -> None:
+        cfg = load_config(config_file)
+        assert cfg.local.fallback_mode == "fail-open"
+
+    def test_fallback_mode_fail_closed_loaded(self, tmp_path: Path) -> None:
+        p = tmp_path / "config.yaml"
+        p.write_text(textwrap.dedent("""\
+            downstream_servers:
+              s1:
+                command: echo
+            fallback_mode: fail-closed
+            policy:
+              default_action: log
+        """))
+        cfg = load_config(p)
+        assert cfg.local.fallback_mode == "fail-closed"
+
+    def test_invalid_fallback_mode_raises(self, tmp_path: Path) -> None:
+        p = tmp_path / "config.yaml"
+        p.write_text(textwrap.dedent("""\
+            downstream_servers:
+              s1:
+                command: echo
+            fallback_mode: panic
+            policy:
+              default_action: log
+        """))
+        with pytest.raises(ValueError, match="Invalid fallback_mode"):
+            load_config(p)
+
+
+class TestFallbackPolicy:
+    def test_fallback_policy_action_is_log(self) -> None:
+        assert FALLBACK_POLICY.global_rule.action == "log"
+
+    def test_fallback_policy_has_no_server_rules(self) -> None:
+        assert FALLBACK_POLICY.server_rules == {}
+
+    def test_fallback_policy_has_no_tool_rules(self) -> None:
+        assert FALLBACK_POLICY.tool_rules == {}
+
+    def test_fallback_policy_severity_is_low(self) -> None:
+        assert FALLBACK_POLICY.global_rule.severity_threshold == "low"
 
 
 class TestPolicy:
